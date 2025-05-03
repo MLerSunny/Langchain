@@ -1,0 +1,35 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt || true
+
+      - name: Lint & test
+        run: |
+          make lint
+          pytest -q
+      
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build & health-check
+        run: |
+          docker-compose up -d --build
+          timeout 300 bash -c 'until curl -sf http://localhost:8000/health; do sleep 5; done'
+          docker-compose down -v 
