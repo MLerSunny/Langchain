@@ -1,0 +1,45 @@
+# Set default behavior to automatically normalize line endings
+* text=auto
+
+# Source code
+*.py text diff=python
+*.js text
+*.html text diff=html
+*.css text diff=css
+*.json text
+*.yaml text
+*.yml text
+*.md text diff=markdown
+
+# Git LFS tracking for large binary files
+*.pdf filter=lfs diff=lfs merge=lfs -text
+*.docx filter=lfs diff=lfs merge=lfs -text
+*.xlsx filter=lfs diff=lfs merge=lfs -text
+*.pptx filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.gguf filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+
+# Jupyter Notebook
+*.ipynb text eol=lf
+# Strip output cells from notebooks
+*.ipynb filter=nbstripout
+
+# Declare files that will always have CRLF line endings on checkout (Windows)
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Declare files that will always have LF line endings on checkout (Unix)
+*.sh text eol=lf
+
+# Denote all files that are truly binary and should not be modified
+*.ico binary
+*.zip binary
+*.gz binary
+*.jar binary

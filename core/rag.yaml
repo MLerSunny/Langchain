@@ -1,0 +1,52 @@
+# RAG Configuration for Insurance Assistant
+
+# Document processing
+document_processing:
+  chunk_size: 256
+  chunk_overlap: 32
+  embedding_model: "all-MiniLM-L6-v2"
+
+# Vector database
+vector_db:
+  type: "${vector_db}"
+  persist_directory: ".chroma"
+  collection_name: "insurance_docs"
+  distance_function: "cosine"
+
+# Retrieval
+retriever:
+  search_type: "mmr"  # Maximum Marginal Relevance to balance relevance and diversity
+  k: 8               # Number of documents to retrieve
+  lambda_mult: 0.3   # Diversity vs. relevance balance (lower = more diverse)
+  fetch_k: 20        # Initial number of docs to fetch before reranking
+
+# LLM
+llm:
+  model_name: "deepseek-coder:7b-instruct-v1.5"
+  max_tokens: 2048
+  temperature: 0.2
+  top_p: 0.95
+  streaming: true
+
+# Prompt templates
+prompts:
+  system_template: |
+    You are an insurance expert assistant trained to help with insurance questions.
+    You will be given context information extracted from insurance documents and a question.
+    
+    Guidelines:
+    1. Answer strictly based on the provided context information
+    2. Cite the source documents in your answer using [Document X] format
+    3. If the answer is not in the context, say "I don't have information about that in my current documents."
+    4. Be objective and factual - stick to what's in the documents
+    5. For questions about coverage, always clarify that the official policy document is the final authority
+    
+    Your goal is to provide accurate insurance information to help the user understand their coverage options.
+  
+  user_template: |
+    Context information:
+    {context}
+    
+    Question: {question}
+  
+  assistant_template: ""  # Empty placeholder used when needed 

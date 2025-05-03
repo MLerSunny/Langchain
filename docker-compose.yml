@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: langchain_api
+    restart: unless-stopped
+    ports:
+      - "${FASTAPI_PORT:-8000}:8000"
+    volumes:
+      - ./:/app
+      - ./data/chroma:/app/data/chroma
+    env_file:
+      - .env
+    depends_on:
+      - vectordb
+      - ollama
+    networks:
+      - langchain-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  vectordb:
+    image: qdrant/qdrant:latest
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    networks:
+      - langchain-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    networks:
+      - langchain-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: langchain_streamlit
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    env_file:
+      - .env
+    depends_on:
+      - api
+      - ollama
+    networks:
+      - langchain-network
+    command: streamlit run streamlit_app.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  ollama:
+
+networks:
+  langchain-network:
+    driver: bridge 
