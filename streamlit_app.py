@@ -53,6 +53,11 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Initialize session state for model name
+if 'model_name' not in st.session_state:
+    # Default to deepseek-llm:7b
+    st.session_state.model_name = "deepseek-llm:7b"
+
 # App styling
 st.markdown("""
 <style>
@@ -202,17 +207,35 @@ def display_documents_table(documents):
     
     # Create a DataFrame from document metadata
     docs_data = []
-    for i, doc in enumerate(documents):
-        # Get the first 100 characters of content
-        content_preview = doc.page_content[:100] + "..." if len(doc.page_content) > 100 else doc.page_content
+    
+    # Group documents by source file to show a more consolidated view
+    sources = {}
+    for doc in documents:
+        source = doc.metadata.get("source", "Unknown")
+        if source not in sources:
+            sources[source] = {
+                "count": 1,
+                "total_chars": len(doc.page_content),
+                "preview": doc.page_content[:100] + "..." if len(doc.page_content) > 100 else doc.page_content,
+                "topic": doc.metadata.get("topic", "Unknown")
+            }
+        else:
+            sources[source]["count"] += 1
+            sources[source]["total_chars"] += len(doc.page_content)
+    
+    # Create a summary dataframe 
+    for i, (source, info) in enumerate(sources.items()):
+        # Extract file type from source
+        file_type = os.path.splitext(source)[1].lower() if "." in source else ""
         
-        # Add to data
         docs_data.append({
             "ID": i,
-            "Source": doc.metadata.get("source", "Unknown"),
-            "Topic": doc.metadata.get("topic", "Unknown"),
-            "Length (chars)": len(doc.page_content),
-            "Content Preview": content_preview
+            "Source": source,
+            "File Type": file_type,
+            "Topic": info["topic"],
+            "Pages/Sections": info["count"],
+            "Total Length (chars)": info["total_chars"],
+            "Content Preview": info["preview"]
         })
     
     # Display as a DataFrame
@@ -221,7 +244,8 @@ def display_documents_table(documents):
     
     # Display some statistics
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Documents", len(documents))
+    col1.metric("Unique Documents", len(sources))
+    col1.metric("Total Pages/Sections", len(documents))
     
     avg_length = sum(len(doc.page_content) for doc in documents) / len(documents)
     col2.metric("Average Length", f"{int(avg_length)} chars")
@@ -229,15 +253,17 @@ def display_documents_table(documents):
     total_chars = sum(len(doc.page_content) for doc in documents)
     col3.metric("Total Content Size", f"{total_chars:,} chars")
     
-    # Show distribution of document lengths
-    fig = px.histogram(
-        df, 
-        x="Length (chars)", 
-        title="Document Length Distribution",
-        nbins=20,
-        color_discrete_sequence=["#3498db"]
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    # Show distribution of document lengths by file type
+    if len(docs_data) > 1:
+        fig = px.bar(
+            df, 
+            x="Source", 
+            y="Total Length (chars)",
+            color="File Type",
+            title="Document Size by Source",
+            labels={"Total Length (chars)": "Character Count", "Source": "Document Source"}
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
 def display_chunks_table(chunks):
     """Display a table of document chunks."""
@@ -251,28 +277,67 @@ def display_chunks_table(chunks):
         # Get the first 100 characters of content
         content_preview = chunk.page_content[:100] + "..." if len(chunk.page_content) > 100 else chunk.page_content
         
+        # Extract file type from source
+        source = chunk.metadata.get("source", "Unknown")
+        file_type = os.path.splitext(source)[1].lower() if "." in source else ""
+        
         # Add to data
         chunks_data.append({
             "ID": i,
-            "Source": chunk.metadata.get("source", "Unknown"),
+            "Source": source,
+            "File Type": file_type,
             "Topic": chunk.metadata.get("topic", "Unknown"),
             "Length (chars)": len(chunk.page_content),
             "Content Preview": content_preview
         })
     
-    # Display as a DataFrame
+    # Display as a DataFrame with filtering
     df = pd.DataFrame(chunks_data)
-    st.dataframe(df, use_container_width=True)
+    
+    # Add filters for different document types
+    col1, col2 = st.columns(2)
+    with col1:
+        file_types = ["All"] + sorted(df["File Type"].unique().tolist())
+        selected_type = st.selectbox("Filter by File Type", file_types)
+    
+    with col2:
+        sources = ["All"] + sorted(df["Source"].unique().tolist())
+        selected_source = st.selectbox("Filter by Source", sources)
+    
+    # Apply filters
+    filtered_df = df.copy()
+    if selected_type != "All":
+        filtered_df = filtered_df[filtered_df["File Type"] == selected_type]
+    if selected_source != "All":
+        filtered_df = filtered_df[filtered_df["Source"] == selected_source]
+    
+    # Display filtered dataframe
+    st.dataframe(filtered_df, use_container_width=True)
     
     # Display some statistics
     col1, col2, col3 = st.columns(3)
     col1.metric("Total Chunks", len(chunks))
+    col1.metric("Showing", len(filtered_df))
     
     avg_length = sum(len(chunk.page_content) for chunk in chunks) / len(chunks)
     col2.metric("Average Chunk Length", f"{int(avg_length)} chars")
     
     total_chars = sum(len(chunk.page_content) for chunk in chunks)
     col3.metric("Total Content Size", f"{total_chars:,} chars")
+    
+    # Count chunks per source
+    source_counts = df.groupby(["Source", "File Type"]).size().reset_index(name="Chunk Count")
+    
+    # Show distribution of chunks by source and file type
+    fig = px.bar(
+        source_counts, 
+        x="Source", 
+        y="Chunk Count",
+        color="File Type",
+        title="Chunks Distribution by Source",
+        labels={"Chunk Count": "Number of Chunks", "Source": "Document Source"}
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 def display_sharegpt_preview(sharegpt_data, max_display=5):
     """Display a preview of the ShareGPT format data."""
@@ -346,7 +411,47 @@ def display_system_status():
         if st.button("Refresh Status"):
             # Clear the cache for check_system_status
             check_system_status.clear()
-            st.experimental_rerun()
+            st.rerun()
+
+@st.cache_data(ttl=CACHE_TTL)
+def get_available_models() -> List[str]:
+    """
+    Get a list of available models from Ollama.
+    
+    Returns:
+        List of available model names
+    """
+    default_models = ["deepseek-llm:7b", "deepseek-r1:32b", "deepseek-coder:instruct", "deepseek-coder:latest"]
+    
+    try:
+        # Try to connect to Ollama and get available models
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags")
+        
+        if response.status_code != 200:
+            return default_models
+        
+        # Extract model names
+        models = response.json().get("models", [])
+        model_names = [model.get("name") for model in models]
+        
+        if not model_names:
+            return default_models
+            
+        # Put deepseek-llm:7b first if it exists in the list
+        if "deepseek-llm:7b" in model_names:
+            model_names.remove("deepseek-llm:7b")
+            return ["deepseek-llm:7b"] + model_names
+        
+        # Put deepseek-r1:32b second if it exists
+        if "deepseek-r1:32b" in model_names:
+            model_names.remove("deepseek-r1:32b")
+            model_names = ["deepseek-r1:32b"] + model_names
+            
+        return model_names
+        
+    except requests.exceptions.RequestException:
+        # Return default models if can't connect to Ollama
+        return default_models
 
 def convert_documents_tab():
     """Tab for converting documents to ShareGPT format."""
@@ -365,14 +470,34 @@ def convert_documents_tab():
     suggested_chunk_size = DEFAULT_CHUNK_SIZE if memory_usage < 70 else int(DEFAULT_CHUNK_SIZE * 0.75)
     
     with st.form("convert_form"):
-        # File upload
-        supported_types = get_supported_file_types()
-        st.markdown(f"**Step 1:** Upload your documents (Supported formats: {', '.join(supported_types)})")
-        uploaded_files = st.file_uploader(
-            "Upload Documents", 
-            accept_multiple_files=True, 
-            type=[ext[1:] for ext in supported_types]  # Remove the dot
+        # File upload or path input selection
+        st.markdown(f"**Step 1:** Choose document source")
+        doc_source = st.radio(
+            "Select document source",
+            ["Upload documents", "Use existing documents path"],
+            help="Either upload new documents or specify a path to existing documents"
         )
+        
+        if doc_source == "Upload documents":
+            # File upload (original functionality)
+            supported_types = get_supported_file_types()
+            st.markdown(f"**Upload your documents** (Supported formats: {', '.join(supported_types)})")
+            uploaded_files = st.file_uploader(
+                "Upload Documents", 
+                accept_multiple_files=True, 
+                type=[ext[1:] for ext in supported_types]  # Remove the dot
+            )
+            existing_path = None
+        else:
+            # Path selection for existing documents
+            st.markdown("**Specify path to existing documents**")
+            existing_path = st.text_input(
+                "Documents Path",
+                value=os.path.join(DATA_DIR, "raw"),
+                help="Path to directory containing existing documents (read-only access)"
+            )
+            st.info("⚠️ The system will only read from this path without modifying the original documents.")
+            uploaded_files = None
         
         # Chunking parameters
         st.markdown("**Step 2:** Configure document processing")
@@ -449,7 +574,7 @@ def convert_documents_tab():
         )
     
     # Process when the form is submitted
-    if submit_button and uploaded_files:
+    if submit_button and (uploaded_files or existing_path):
         # Set up a progress tracking system
         progress_container = st.empty()
         status_container = st.empty()
@@ -459,18 +584,30 @@ def convert_documents_tab():
             progress_bar = st.progress(0)
         
         with status_container:
-            status = st.info("Saving uploaded files...")
+            if uploaded_files:
+                status = st.info("Saving uploaded files...")
+            else:
+                status = st.info("Reading from existing documents path...")
         
         try:
-            # Save uploaded files
-            temp_dir = save_uploaded_files(uploaded_files)
+            # Handle document source based on selection
+            if uploaded_files:
+                # Save uploaded files (original functionality)
+                temp_dir = save_uploaded_files(uploaded_files)
+                source_dir = temp_dir
+            else:
+                # Use existing path directly
+                if not os.path.exists(existing_path):
+                    st.error(f"Path {existing_path} does not exist!")
+                    return
+                source_dir = existing_path
             
             # Update progress
             progress_bar.progress(10)
             status.info("Loading documents...")
             
             # Load documents
-            documents = load_documents(temp_dir)
+            documents = load_documents(source_dir)
             
             # Update progress
             progress_bar.progress(30)
@@ -544,16 +681,30 @@ def convert_documents_tab():
         except Exception as e:
             status.error(f"Error processing documents: {e}")
         finally:
-            # Clean up temporary directory
-            if 'temp_dir' in locals():
+            # Clean up temporary directory only if we created one
+            if 'temp_dir' in locals() and uploaded_files:
                 shutil.rmtree(temp_dir)
     
     elif submit_button:
-        st.warning("Please upload at least one document to process.")
+        st.warning("Please either upload documents or specify a valid path to existing documents.")
     
     # Add documentation section
     with st.expander("📚 Documentation & Tips"):
         st.markdown("""
+        ### Document Processing
+        
+        **Two ways to provide documents:**
+        1. **Upload Documents**: Upload new documents directly through the interface
+        2. **Use Existing Path**: Specify a path to documents that already exist on your drive
+        
+        **Important**: When using an existing documents path, the system:
+        - Uses read-only access to the original documents
+        - Never modifies or deletes the original files
+        - Creates processed versions and vector embeddings in its own data directory
+        - Maintains the original files unchanged for reference
+        
+        This approach lets you use your existing document repositories for RAG and fine-tuning without duplicating or altering them.
+        
         ### How Document Conversion Works
         
         1. **Document Loading**: Files are loaded using LangChain's document loaders
@@ -597,7 +748,7 @@ def query_rag_tab():
             ```
             3. **In another terminal, pull the DeepSeek model**:
             ```
-            ollama pull deepseek-coder:7b-instruct-v1.5
+            ollama pull deepseek-r1:32b
             ```
             
             You can also use the provided Makefile command:
@@ -641,11 +792,15 @@ def app_settings_tab():
     # Model settings
     st.subheader("Model Settings")
     
-    # Model selection
-    model = st.text_input(
+    # Get available models from Ollama
+    available_models = get_available_models()
+    
+    # Model selection using a selectbox
+    model = st.selectbox(
         "Model Name",
-        settings.model_name,
-        help="Name of the DeepSeek model to use"
+        available_models,
+        index=available_models.index(st.session_state.model_name) if st.session_state.model_name in available_models else 0,
+        help="Select a DeepSeek model to use"
     )
     
     # Ollama URL
@@ -667,7 +822,11 @@ def app_settings_tab():
     
     # Apply button
     if st.button("Apply Settings"):
-        st.warning("Settings functionality is not yet implemented.")
+        # Update session state with new values
+        st.session_state.model_name = model
+        st.success("Settings updated successfully!")
+        # Force refresh to apply changes
+        st.rerun()
     
     # System information
     st.subheader("System Information")
