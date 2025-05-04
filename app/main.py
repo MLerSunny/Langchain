@@ -15,9 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi_limiter import FastAPILimiter, limiter
 from jose import jwt, JWTError
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.schema import Document
-from langchain.vectorstores import Chroma, Qdrant
+from langchain.callbacks.base import BaseCallbackHandler
+from langchain.chains.question_answering import load_qa_chain
+from langchain.chains import RetrievalQA
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_community.vectorstores import Qdrant
 from pydantic import BaseModel
 import uvicorn
 import traceback

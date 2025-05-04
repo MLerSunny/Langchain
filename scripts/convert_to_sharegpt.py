@@ -15,8 +15,9 @@ import time
 import re
 import random
 import requests
-from typing import List, Dict, Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from typing import List, Dict, Any, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 
 # Add parent directory to path for importing config
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -47,6 +48,13 @@ logger = logging.getLogger(__name__)
 LLM_AVAILABLE = None
 MAX_BATCH_SIZE = 20  # Maximum number of documents to process at once
 
+# Global variables for process control
+STOP_PROCESSING = threading.Event()
+PROGRESS_CALLBACK = None
+PROGRESS_LOCK = threading.Lock()
+CHUNKS_PROCESSED = 0
+CURRENT_CHUNK = 0
+
 def check_llm_availability() -> bool:
     """
     Check if the LLM service (Ollama) is available.
@@ -73,7 +81,34 @@ def check_llm_availability() -> bool:
         models = response.json().get("models", [])
         model_names = [model.get("name") for model in models]
         
+        # If deepseek-llm:7b is available, prioritize it
+        if "deepseek-llm:7b" in model_names:
+            settings.model_name = "deepseek-llm:7b"
+            logger.info(f"Using preferred model deepseek-llm:7b")
+            LLM_AVAILABLE = True
+            return True
+        
+        # If deepseek-r1:32b is available but we should use rule-based approach for large models
+        if "deepseek-r1:32b" in model_names:
+            settings.model_name = "deepseek-r1:32b"
+            logger.info(f"Using preferred model deepseek-r1:32b")
+            # For 32B models, we'll use rule-based approach to avoid timeouts
+            logger.warning("Large 32B model detected - will use rule-based processing to avoid timeouts")
+            LLM_AVAILABLE = False
+            return False
+        
         if settings.model_name in model_names:
+            # Also check if model name contains markers of very large models
+            if "32b" in settings.model_name.lower() or "32-b" in settings.model_name.lower():
+                logger.warning(f"Large model {settings.model_name} detected - will use rule-based processing to avoid timeouts")
+                LLM_AVAILABLE = False
+                return False
+            # For 7B models, they're fine to use with LLM
+            elif "7b" in settings.model_name.lower() or "7-b" in settings.model_name.lower():
+                logger.info(f"Using 7B model {settings.model_name} for LLM processing")
+                LLM_AVAILABLE = True
+                return True
+                
             logger.info(f"LLM model {settings.model_name} is available")
             LLM_AVAILABLE = True
             return True
@@ -82,9 +117,21 @@ def check_llm_availability() -> bool:
             
             # If we have any model available, we can still use it
             if models:
-                logger.info(f"Will use available model: {models[0]['name']} instead")
-                LLM_AVAILABLE = True
-                return True
+                # Use the first available model that's not a huge model
+                for model in models:
+                    model_name = model['name']
+                    # Prefer 7B models
+                    if "7b" in model_name.lower() or "7-b" in model_name.lower():
+                        settings.model_name = model_name
+                        logger.info(f"Will use available 7B model: {settings.model_name} instead")
+                        LLM_AVAILABLE = True
+                        return True
+                    # Avoid 32B models
+                    elif "32b" not in model_name.lower() and "32-b" not in model_name.lower():
+                        settings.model_name = model_name
+                        logger.info(f"Will use available model: {settings.model_name} instead")
+                        LLM_AVAILABLE = True
+                        return True
             
             LLM_AVAILABLE = False
             return False
@@ -304,7 +351,7 @@ def generate_questions_from_content(content: str, num_questions: int = 3) -> Lis
     import json
     
     # Truncate content if too long
-    max_content_length = 4000
+    max_content_length = 1000  # Reduced from 2000 to help prevent timeouts with large models
     if len(content) > max_content_length:
         content = content[:max_content_length] + "..."
     
@@ -331,7 +378,7 @@ def generate_questions_from_content(content: str, num_questions: int = 3) -> Lis
                     "top_p": 0.9,
                 }
             },
-            timeout=30  # Set a timeout to avoid hanging
+            timeout=300  # Increased timeout for large models (was 120)
         )
         
         if response.status_code != 200:
@@ -402,6 +449,11 @@ def enhance_answer(content: str, question: str) -> str:
     
     import requests
     
+    # Truncate content if too long
+    max_content_length = 1000  # Reduced from 2000 to help prevent timeouts
+    if len(content) > max_content_length:
+        content = content[:max_content_length] + "..."
+    
     prompt = f"""
     Given the following QUESTION and CONTENT from a document, create a well-structured, 
     comprehensive answer that directly addresses the question using only information from the content.
@@ -427,7 +479,7 @@ def enhance_answer(content: str, question: str) -> str:
                     "top_p": 0.9,
                 }
             },
-            timeout=45  # Longer timeout for answer generation
+            timeout=360  # Increased timeout for large models (was 180)
         )
         
         if response.status_code != 200:
@@ -456,43 +508,79 @@ def process_document_chunk(chunk_data):
     Returns:
         List of conversation objects
     """
+    global CHUNKS_PROCESSED, CURRENT_CHUNK
+    
     i, doc, system_prompt, questions_per_chunk, enhance_answers = chunk_data
     conversations = []
     
+    # Check if processing should stop
+    if STOP_PROCESSING.is_set():
+        logger.info(f"Skipping document chunk {i} due to stop request")
+        return []
+    
     logger.info(f"Processing document chunk {i}")
     
-    # Generate questions from document content
-    questions = generate_questions_from_content(doc.page_content, questions_per_chunk)
+    # Update global progress counters
+    with PROGRESS_LOCK:
+        CHUNKS_PROCESSED += 1
+        CURRENT_CHUNK = i
+        # Call progress callback with the values directly
+        if PROGRESS_CALLBACK:
+            try:
+                PROGRESS_CALLBACK(i, CHUNKS_PROCESSED)
+            except Exception as e:
+                # If callback errors, just log it but continue processing
+                logger.warning(f"Progress callback error for chunk {i}: {e}")
     
-    for question in questions:
-        # Create conversation object
-        conversation = {"conversations": []}
+    try:
+        # Extract content from document
+        content = doc.page_content
+        source = doc.metadata.get("source", "unknown")
+        topic = doc.metadata.get("topic", "unknown")
         
-        # Add system prompt
-        conversation["conversations"].append({
-            "from": "system",
-            "value": system_prompt
-        })
+        # Generate questions based on the content
+        questions = generate_questions_from_content(content, questions_per_chunk)
         
-        # Add user question
-        conversation["conversations"].append({
-            "from": "human",
-            "value": question
-        })
+        # Create conversation for each question
+        for q in questions:
+            if STOP_PROCESSING.is_set():
+                break
+                
+            # Create the answer
+            if enhance_answers:
+                answer = enhance_answer(content, q)
+            else:
+                answer = content
+            
+            # Create conversation object
+            conv = {
+                "id": f"chunk_{i}_q_{hash(q) % 10000}",
+                "source": source,
+                "topic": topic,
+                "conversations": [
+                    {
+                        "from": "human",
+                        "value": q
+                    },
+                    {
+                        "from": "gpt",
+                        "value": answer
+                    }
+                ]
+            }
+            
+            # Add system prompt if provided
+            if system_prompt:
+                conv["system"] = system_prompt
+                
+            conversations.append(conv)
         
-        # Add assistant response
-        answer = doc.page_content
-        if enhance_answers:
-            answer = enhance_answer(doc.page_content, question)
+        logger.info(f"Generated {len(conversations)} conversations from chunk {i}")
+        return conversations
         
-        conversation["conversations"].append({
-            "from": "assistant",
-            "value": answer
-        })
-        
-        conversations.append(conversation)
-    
-    return conversations
+    except Exception as e:
+        logger.error(f"Error processing chunk {i}: {e}")
+        return []
 
 def convert_to_sharegpt_format(
     documents: List[Document], 
@@ -500,80 +588,86 @@ def convert_to_sharegpt_format(
     questions_per_chunk: int = 2,
     enhance_answers: bool = True,
     max_workers: int = 4,
-    batch_size: int = None
+    batch_size: int = None,
+    progress_callback: Callable = None,
 ) -> List[Dict]:
     """
-    Convert document chunks to ShareGPT format for fine-tuning.
+    Convert documents to ShareGPT format by generating questions and answers.
     
     Args:
-        documents: List of document chunks
-        system_prompt: Optional system prompt to include
-        questions_per_chunk: Number of questions to generate per chunk
-        enhance_answers: Whether to enhance answers using LLM
+        documents: List of Document objects to process
+        system_prompt: Optional system prompt to set context
+        questions_per_chunk: Number of questions to generate per document
+        enhance_answers: Whether to enhance answers with LLM
         max_workers: Maximum number of parallel workers
-        batch_size: Limit processing to this many chunks (for memory management)
+        batch_size: Maximum number of documents to process at once
+        progress_callback: Optional callback function to report progress
         
     Returns:
         List of conversation objects in ShareGPT format
     """
-    if not system_prompt:
-        # Load domain-specific system prompts
-        system_prompts = {
-            "insurance": """You are an insurance expert assistant. You provide accurate, helpful information about insurance policies, coverages, and claims. Answer questions based on your knowledge of insurance best practices and regulations.""",
-            "finance": """You are a finance expert assistant. You provide accurate, helpful information about financial planning, investments, and money management. Answer questions based on your knowledge of financial best practices and regulations.""",
-            "healthcare": """You are a healthcare expert assistant. You provide accurate, helpful information about medical conditions, treatments, and healthcare systems. Answer questions based on your knowledge of healthcare best practices.""",
-            "legal": """You are a legal expert assistant. You provide accurate, helpful information about laws, regulations, and legal processes. Answer questions based on your knowledge of legal best practices.""",
-            "technology": """You are a technology expert assistant. You provide accurate, helpful information about software, hardware, and digital services. Answer questions based on your knowledge of technology best practices.""",
-            "general": """You are a helpful assistant that provides accurate, informative responses based on the content provided. Answer questions factually using only the information available in the provided content."""
-        }
-        
-        # Try to detect document domain from content or metadata
-        domain = "general"
-        if documents:
-            sample_text = documents[0].page_content.lower()
-            sample_topic = documents[0].metadata.get("topic", "").lower()
-            
-            # Check for domain keywords in content or metadata
-            for key in system_prompts.keys():
-                if key in sample_text or key in sample_topic:
-                    domain = key
-                    break
-            
-            logger.info(f"Detected document domain: {domain}")
-        
-        system_prompt = system_prompts[domain]
+    global PROGRESS_CALLBACK, STOP_PROCESSING, CHUNKS_PROCESSED, CURRENT_CHUNK
     
-    sharegpt_data = []
+    if not documents:
+        logger.warning("No documents to convert")
+        return []
     
-    # Apply memory management - limit the number of chunks to process
-    if batch_size and batch_size < len(documents):
-        logger.warning(f"Limiting processing to {batch_size} chunks for memory management")
-        # Select a diverse sample from the documents
+    # Set progress callback if provided
+    PROGRESS_CALLBACK = progress_callback
+    
+    # Reset progress tracking
+    STOP_PROCESSING.clear()
+    CHUNKS_PROCESSED = 0
+    CURRENT_CHUNK = 0
+    
+    # Set batch size if specified
+    if batch_size:
         documents = documents[:batch_size]
     
-    # Prepare data for parallel processing
-    chunk_data = [
-        (i, doc, system_prompt, questions_per_chunk, enhance_answers) 
+    # Create tasks for parallel processing
+    tasks = [
+        (i, doc, system_prompt, questions_per_chunk, enhance_answers)
         for i, doc in enumerate(documents)
     ]
     
-    # Process in parallel
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_chunk = {
-            executor.submit(process_document_chunk, data): data 
-            for data in chunk_data
-        }
-        
-        for future in as_completed(future_to_chunk):
-            try:
-                conversations = future.result()
-                sharegpt_data.extend(conversations)
-            except Exception as e:
-                i = future_to_chunk[future][0]
-                logger.error(f"Error processing chunk {i}: {e}")
+    logger.info(f"Converting {len(documents)} documents to ShareGPT format with {max_workers} workers")
     
-    logger.info(f"Created {len(sharegpt_data)} conversation examples")
-    return sharegpt_data
+    # Define a wrapper for error handling
+    def safe_process(chunk_data):
+        try:
+            return process_document_chunk(chunk_data)
+        except Exception as e:
+            logger.error(f"Error in worker thread: {e}")
+            return []
+    
+    # Process documents in parallel
+    results = []
+    
+    # Adjust workers count if fewer documents than workers
+    actual_workers = min(max_workers, len(documents))
+    
+    try:
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            # Submit all tasks
+            future_to_task = {executor.submit(safe_process, task): task for task in tasks}
+            
+            # Process results as they complete
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    conversations = future.result()
+                    results.extend(conversations)
+                except Exception as e:
+                    logger.error(f"Task {task[0]} generated an exception: {e}")
+    except KeyboardInterrupt:
+        logger.warning("Processing interrupted by user")
+        STOP_PROCESSING.set()
+    
+    # Sort results by source and ID for consistency
+    results.sort(key=lambda x: (x.get("source", ""), x.get("id", "")))
+    
+    logger.info(f"Generated {len(results)} conversations in ShareGPT format")
+    return results
 
 def main():
     """Main function to convert documents to ShareGPT format."""

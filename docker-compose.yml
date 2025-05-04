@@ -17,6 +17,7 @@ services:
     depends_on:
       - vectordb
       - ollama
+      - llm
     networks:
       - langchain-network
     healthcheck:
@@ -58,6 +59,33 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+              
+  llm:
+    image: ghcr.io/vllm-project/vllm:latest
+    container_name: vllm_server
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./models:/models
+    networks:
+      - langchain-network
+    command: python -m vllm.entrypoints.openai.api_server --model ${MODEL_PATH:-/models/mistral-7b-instruct-v0.2} --port 8001
+    environment:
+      - MODEL_PATH=${MODEL_PATH:-/models/mistral-7b-instruct-v0.2}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   streamlit:
     build:

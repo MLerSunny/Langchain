@@ -13,6 +13,7 @@ import time
 import platform
 import psutil
 import requests
+import threading
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -35,7 +36,7 @@ from scripts.convert_to_sharegpt import (
     convert_to_sharegpt_format,
     check_llm_availability
 )
-from core.settings import settings, DATA_DIR, OLLAMA_BASE_URL
+from core.settings import settings, DATA_DIR, OLLAMA_BASE_URL, CHROMA_PERSIST_DIRECTORY, FASTAPI_PORT
 
 # Constants for memory management
 MAX_MEMORY_PERCENT = 80  # Maximum memory usage percentage
@@ -265,8 +266,14 @@ def display_documents_table(documents):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-def display_chunks_table(chunks):
-    """Display a table of document chunks."""
+def display_chunks_table(chunks, processing_in_progress=False, current_chunk_index=0):
+    """Display a table of document chunks.
+    
+    Args:
+        chunks: List of document chunks to display
+        processing_in_progress: Whether processing is currently ongoing
+        current_chunk_index: Index of the current chunk being processed
+    """
     if not chunks:
         st.warning("No chunks created")
         return
@@ -310,6 +317,15 @@ def display_chunks_table(chunks):
         filtered_df = filtered_df[filtered_df["File Type"] == selected_type]
     if selected_source != "All":
         filtered_df = filtered_df[filtered_df["Source"] == selected_source]
+    
+    # Show processing indicator if processing is in progress
+    if processing_in_progress:
+        if 'progress_data' in st.session_state:
+            processed = st.session_state.progress_data['chunks_processed']
+            total = st.session_state.progress_data['total_chunks']
+            st.info(f"⏳ Processing document chunks: {processed}/{total}")
+        else:
+            st.info(f"⏳ Processing document chunks: {current_chunk_index + 1}/{len(chunks)}")
     
     # Display filtered dataframe
     st.dataframe(filtered_df, use_container_width=True)
@@ -453,6 +469,67 @@ def get_available_models() -> List[str]:
         # Return default models if can't connect to Ollama
         return default_models
 
+@st.cache_data(ttl=60)  # Cache for 1 minute only
+def check_vector_db_status() -> Dict[str, Any]:
+    """
+    Check the status of the vector database by querying the /vector-db-status endpoint.
+    
+    Returns:
+        Dict with status information about the vector database
+    """
+    try:
+        response = requests.get(f"http://localhost:{FASTAPI_PORT}/vector-db-status", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {
+                "db_type": "unknown",
+                "version": "unknown",
+                "is_connected": False,
+                "is_compatible": False,
+                "in_memory": False,
+                "compatibility_message": f"Error: API returned status code {response.status_code}"
+            }
+    except requests.exceptions.RequestException as e:
+        return {
+            "db_type": "unknown",
+            "version": "unknown",
+            "is_connected": False,
+            "is_compatible": False,
+            "in_memory": False,
+            "compatibility_message": f"Error connecting to API: {str(e)}"
+        }
+
+def display_vector_db_status(status: Dict[str, Any]):
+    """Display vector database status information in a formatted way."""
+    
+    # Determine status level
+    if status["is_compatible"] and status["is_connected"]:
+        status_class = "status-ok"
+        icon = "✅"
+    elif status["is_connected"] and not status["is_compatible"]:
+        status_class = "status-warning" 
+        icon = "⚠️"
+    else:
+        status_class = "status-error"
+        icon = "❌"
+        
+    # Create status box
+    st.markdown(f"""
+    <div class="system-status {status_class}">
+        <h3>{icon} Vector Database Status</h3>
+        <p><strong>Database Type:</strong> {status["db_type"].upper()}</p>
+        <p><strong>Version:</strong> {status["version"]}</p>
+        <p><strong>Connected:</strong> {"Yes" if status["is_connected"] else "No"}</p>
+        <p><strong>Compatible:</strong> {"Yes" if status["is_compatible"] else "No"}</p>
+        <p><strong>Storage Mode:</strong> {"In-Memory" if status["in_memory"] else "Persistent"}</p>
+        {f'<p><strong>Documents Count:</strong> {status["docs_count"]}</p>' if status.get("docs_count") is not None else ''}
+        {f'<p><strong>Collection Name:</strong> {status["collection_name"]}</p>' if status.get("collection_name") else ''}
+        {f'<p><strong>Persist Directory:</strong> {status["persist_directory"]}</p>' if status.get("persist_directory") else ''}
+        <p><strong>Status:</strong> {status["compatibility_message"]}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
 def convert_documents_tab():
     """Tab for converting documents to ShareGPT format."""
     st.markdown("## 📄 Convert Documents to ShareGPT Format")
@@ -469,44 +546,51 @@ def convert_documents_tab():
     suggested_batch_size = 20 if memory_usage < 70 else 10 if memory_usage < 85 else 5
     suggested_chunk_size = DEFAULT_CHUNK_SIZE if memory_usage < 70 else int(DEFAULT_CHUNK_SIZE * 0.75)
     
+    # Initialize session state for progress tracking
+    if "progress_data" not in st.session_state:
+        st.session_state.progress_data = {
+            "chunks_processed": 0,
+            "total_chunks": 0,
+            "current_chunk_index": 0
+        }
+    
     with st.form("convert_form"):
-        # File upload or path input selection
-        st.markdown(f"**Step 1:** Choose document source")
-        doc_source = st.radio(
-            "Select document source",
-            ["Upload documents", "Use existing documents path"],
-            help="Either upload new documents or specify a path to existing documents"
+        # Document source selection
+        st.markdown("**Step 1:** Select document source")
+        source_option = st.radio(
+            "Document Source", 
+            ["Upload Files", "Use Existing Path"],
+            index=0,
+            help="Choose where to get the documents from"
         )
         
-        if doc_source == "Upload documents":
-            # File upload (original functionality)
-            supported_types = get_supported_file_types()
-            st.markdown(f"**Upload your documents** (Supported formats: {', '.join(supported_types)})")
+        # Conditionally show upload or path input based on selection
+        if source_option == "Upload Files":
             uploaded_files = st.file_uploader(
                 "Upload Documents", 
-                accept_multiple_files=True, 
-                type=[ext[1:] for ext in supported_types]  # Remove the dot
+                accept_multiple_files=True,
+                type=get_supported_file_types(),
+                help="Upload documents in PDF, DOCX, CSV, TXT, HTML, JSON format"
             )
             existing_path = None
         else:
-            # Path selection for existing documents
-            st.markdown("**Specify path to existing documents**")
-            existing_path = st.text_input(
-                "Documents Path",
-                value=os.path.join(DATA_DIR, "raw"),
-                help="Path to directory containing existing documents (read-only access)"
-            )
-            st.info("⚠️ The system will only read from this path without modifying the original documents.")
             uploaded_files = None
+            existing_path = st.text_input(
+                "Document Path", 
+                os.path.join(DATA_DIR, "raw"),
+                help="Path to directory containing documents"
+            )
         
-        # Chunking parameters
+        # Document processing parameters
         st.markdown("**Step 2:** Configure document processing")
+        
         col1, col2, col3 = st.columns(3)
         chunk_size = col1.slider(
             "Chunk Size (tokens)", 
-            256, 2048, suggested_chunk_size,
-            help="Size of document chunks in tokens. Smaller chunks provide more focused but less context-aware results."
+            128, 2048, suggested_chunk_size,
+            help="Size of document chunks in tokens. Smaller chunks may improve retrieval but lose context."
         )
+        
         chunk_overlap = col2.slider(
             "Chunk Overlap (tokens)", 
             0, 512, DEFAULT_CHUNK_OVERLAP,
@@ -557,10 +641,26 @@ def convert_documents_tab():
         
         # Output options
         st.markdown("**Step 4:** Configure output")
+        
         output_filename = st.text_input(
             "Output Filename", 
             "generated_conversations.json",
             help="Filename for the generated ShareGPT format data"
+        )
+        
+        # Add option to create vector DB for RAG
+        create_vectors = st.checkbox(
+            "Create Vector Database for RAG", 
+            True,
+            help="Create vector embeddings for RAG system (required for Query RAG tab)"
+        )
+        
+        # Add option to append or overwrite
+        file_write_mode = st.radio(
+            "File Write Mode",
+            ["Overwrite existing file", "Append to existing file", "Create new file with timestamp"],
+            index=0,
+            help="Choose how to handle existing files to prevent data loss"
         )
         
         # Submit button
@@ -575,10 +675,25 @@ def convert_documents_tab():
     
     # Process when the form is submitted
     if submit_button and (uploaded_files or existing_path):
-        # Set up a progress tracking system
+        # Set up overall progress tracking
+        st.markdown("### Processing Progress")
         progress_container = st.empty()
         status_container = st.empty()
-        result_container = st.container()
+        
+        # Create a dedicated progress section for document chunking with clear visual separation
+        st.markdown("### Chunking Progress")
+        chunking_status = st.empty()
+        chunk_progress_bar = st.progress(0)
+        chunk_counter = st.empty()
+        
+        # ShareGPT creation progress
+        st.markdown("### ShareGPT Creation Progress")
+        sharegpt_status = st.empty()
+        sharegpt_progress_bar = st.progress(0)
+        sharegpt_counter = st.empty()
+        
+        # Container for results
+        result_display_container = st.container()
         
         with progress_container:
             progress_bar = st.progress(0)
@@ -589,6 +704,24 @@ def convert_documents_tab():
             else:
                 status = st.info("Reading from existing documents path...")
         
+        # Reset progress data
+        st.session_state.progress_data = {
+            "chunks_processed": 0,
+            "total_chunks": 0,
+            "current_chunk_index": 0
+        }
+        
+        # Create a simple queue to get progress updates from the worker threads
+        import queue
+        progress_queue = queue.Queue()
+        
+        # Create a thread-safe progress update function that puts data in the queue
+        def update_chunk_progress(chunk_idx, chunks_processed):
+            try:
+                progress_queue.put((chunk_idx, chunks_processed))
+            except Exception as e:
+                print(f"Error updating progress: {e}")
+
         try:
             # Handle document source based on selection
             if uploaded_files:
@@ -610,52 +743,189 @@ def convert_documents_tab():
             documents = load_documents(source_dir)
             
             # Update progress
-            progress_bar.progress(30)
-            
-            with result_container:
-                st.subheader("Loaded Documents")
-                display_documents_table(documents)
-            
-            status.info("Splitting documents into chunks...")
+            progress_bar.progress(25)
+            chunking_status.info("Splitting documents into chunks...")
             
             # Split documents
             chunks = split_documents(documents, chunk_size, chunk_overlap, max_chunks)
+            total_chunks = len(chunks)
+            
+            # Update session state for progress tracking
+            st.session_state.progress_data["total_chunks"] = total_chunks
+            
+            # Store the chunks in session state for later display
+            st.session_state.processed_chunks = chunks
             
             # Update progress
-            progress_bar.progress(50)
+            progress_bar.progress(40)
+            chunking_status.success("Document chunking complete!")
+            chunk_progress_bar.progress(1.0)
+            chunk_counter.text(f"Documents chunked: {total_chunks}/{total_chunks}")
             
-            with result_container:
+            # Display document chunks in a dedicated container
+            with result_display_container:
+                st.subheader("Loaded Documents")
+                display_documents_table(documents)
+                
                 st.subheader("Document Chunks")
+                # Show initial chunk table
                 display_chunks_table(chunks)
             
             status.info("Converting to ShareGPT format...")
+            sharegpt_status.info("Processing document chunks...")
+            sharegpt_counter.text(f"Chunks processed: 0/{total_chunks}")
             
-            # Convert to ShareGPT format
-            sharegpt_data = convert_to_sharegpt_format(
-                chunks,
-                system_prompt=system_prompt,
-                questions_per_chunk=questions_per_chunk,
-                enhance_answers=enhance_answers,
-                max_workers=max_workers,
-                batch_size=max_chunks
-            )
+            # Start conversion in a separate thread to keep UI responsive
+            import threading
+            processing_results = []
+            processing_done = threading.Event()
             
-            # Update progress
-            progress_bar.progress(90)
+            def process_documents():
+                nonlocal processing_results
+                try:
+                    # Import module in thread to get access to its globals
+                    from scripts.convert_to_sharegpt import convert_to_sharegpt_format
+                    
+                    # Convert to ShareGPT format with progress callback
+                    result = convert_to_sharegpt_format(
+                        chunks,
+                        system_prompt=system_prompt,
+                        questions_per_chunk=questions_per_chunk,
+                        enhance_answers=enhance_answers,
+                        max_workers=max_workers,
+                        batch_size=max_chunks,
+                        progress_callback=update_chunk_progress
+                    )
+                    processing_results.append(result)
+                finally:
+                    # Signal that processing is done
+                    processing_done.set()
+            
+            # Start processing thread
+            processing_thread = threading.Thread(target=process_documents)
+            processing_thread.daemon = True  # Make thread daemon so it doesn't block app shutdown
+            processing_thread.start()
+            
+            # Continue until processing is done
+            chunks_processed = 0
+            while not processing_done.is_set():
+                # Check if there are any progress updates in the queue
+                try:
+                    # Non-blocking queue check with timeout
+                    chunk_idx, new_chunks_processed = progress_queue.get(block=False)
+                    chunks_processed = new_chunks_processed
+                    
+                    # Update progress indicators
+                    sharegpt_counter.text(f"Chunks processed: {chunks_processed}/{total_chunks}")
+                    
+                    # Update session state progress data
+                    st.session_state.progress_data["chunks_processed"] = chunks_processed
+                    st.session_state.progress_data["current_chunk_index"] = chunk_idx
+                    
+                    # Update ShareGPT progress bar
+                    if total_chunks > 0:
+                        sharegpt_progress = chunks_processed / total_chunks
+                        sharegpt_progress_bar.progress(sharegpt_progress)
+                    
+                    # Update main progress bar
+                    if total_chunks > 0:
+                        overall_progress = 40 + int((chunks_processed / total_chunks) * 50)
+                        progress_bar.progress(min(overall_progress, 90))
+                        
+                except queue.Empty:
+                    # No new updates, continue
+                    pass
+                
+                # Brief pause to prevent UI flooding
+                time.sleep(0.1)
+            
+            # Wait for the thread to finish
+            processing_thread.join(timeout=1.0)  # Give it a timeout in case it's stuck
+            
+            # Finalize progress bars
+            sharegpt_progress_bar.progress(1.0)
+            sharegpt_status.success("ShareGPT conversion complete!")
+            sharegpt_counter.text(f"Chunks processed: {total_chunks}/{total_chunks}")
+            
+            # Get the result
+            if processing_results:
+                sharegpt_data = processing_results[0]
+            else:
+                sharegpt_data = []
             
             # Save the output
             output_dir = os.path.join(DATA_DIR, "training")
             os.makedirs(output_dir, exist_ok=True)
+            
+            # Handle file write mode
+            if file_write_mode == "Create new file with timestamp":
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                output_filename = f"{os.path.splitext(output_filename)[0]}_{timestamp}.json"
+            
             output_path = os.path.join(output_dir, output_filename)
             
+            # Handle append mode
+            if file_write_mode == "Append to existing file" and os.path.exists(output_path):
+                status.info(f"Appending to existing file: {output_path}")
+                try:
+                    with open(output_path, "r", encoding="utf-8") as f:
+                        existing_data = json.load(f)
+                    
+                    # Check for duplicates by ID
+                    existing_ids = {conv.get("id", f"id_{i}") for i, conv in enumerate(existing_data)}
+                    new_items = []
+                    
+                    for conv in sharegpt_data:
+                        # Generate ID if not present
+                        if "id" not in conv:
+                            conv["id"] = f"id_{hash(json.dumps(conv)) % 100000}"
+                        
+                        # Add only if not already in the file
+                        if conv.get("id") not in existing_ids:
+                            new_items.append(conv)
+                    
+                    # Combine existing and new data
+                    sharegpt_data = existing_data + new_items
+                    
+                    st.info(f"Added {len(new_items)} new conversations to existing file (skipped {len(sharegpt_data) - len(new_items) - len(existing_data)} duplicates)")
+                    
+                except Exception as e:
+                    st.warning(f"Error reading existing file: {e}. Will create new file.")
+            
+            # Write the output file
             with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(sharegpt_data, f, indent=2, ensure_ascii=False)
+            
+            # Create vector database for RAG if requested
+            if create_vectors:
+                status.info("Creating vector database for RAG queries...")
+                try:
+                    # Import here to avoid circular imports
+                    from scripts.ingest import create_vector_db_from_documents
+                    
+                    # Create vector DB from the loaded documents
+                    vector_db_path = os.path.join(DATA_DIR, "vectorstore")
+                    create_vector_db_result = create_vector_db_from_documents(
+                        documents=chunks, 
+                        persist_directory=vector_db_path
+                    )
+                    
+                    if create_vector_db_result:
+                        status.success(f"Vector database created successfully at {vector_db_path}")
+                    else:
+                        status.warning("Vector database creation returned no result")
+                        
+                except Exception as e:
+                    status.error(f"Error creating vector database: {e}")
+                    import traceback
+                    print(f"Vector DB creation error: {traceback.format_exc()}")
             
             # Update progress
             progress_bar.progress(100)
             status.success(f"Processing complete! Saved to {output_path}")
             
-            with result_container:
+            # Display results in the dedicated container
+            with result_display_container:
                 st.subheader("ShareGPT Format Preview")
                 display_sharegpt_preview(sharegpt_data)
                 
@@ -679,11 +949,24 @@ def convert_documents_tab():
                 """)
             
         except Exception as e:
+            st.error(f"Error processing documents: {e}")
             status.error(f"Error processing documents: {e}")
+            import traceback
+            print(traceback.format_exc())
         finally:
             # Clean up temporary directory only if we created one
             if 'temp_dir' in locals() and uploaded_files:
                 shutil.rmtree(temp_dir)
+    
+    # Display processing status if chunks exist but processing was interrupted
+    elif 'processed_chunks' in st.session_state and st.session_state.processed_chunks:
+        with st.container():
+            st.subheader("Document Chunks")
+            display_chunks_table(
+                st.session_state.processed_chunks,
+                processing_in_progress=st.session_state.processing_in_progress,
+                current_chunk_index=st.session_state.progress_data['current_chunk']
+            )
     
     elif submit_button:
         st.warning("Please either upload documents or specify a valid path to existing documents.")
@@ -729,6 +1012,8 @@ def convert_documents_tab():
 
 def query_rag_tab():
     """Tab for querying the RAG system."""
+    import requests  # Add this import at the beginning of the function
+    
     st.markdown("## 🔍 Query RAG System")
     
     if not check_llm_availability():
@@ -748,7 +1033,7 @@ def query_rag_tab():
             ```
             3. **In another terminal, pull the DeepSeek model**:
             ```
-            ollama pull deepseek-r1:32b
+            ollama pull deepseek-llm:7b
             ```
             
             You can also use the provided Makefile command:
@@ -760,7 +1045,264 @@ def query_rag_tab():
             """)
         return
     
-    st.markdown("Coming soon! This tab will allow querying the RAG system.")
+    # Check if RAG API is running and get vector DB status
+    try:
+        health_response = requests.get(f"http://localhost:{FASTAPI_PORT}/health", timeout=2)
+        if health_response.status_code == 200:
+            # API is running, get vector DB status
+            vector_db_status = check_vector_db_status()
+            display_vector_db_status(vector_db_status)
+            
+            # If vector DB is not connected, show warning
+            if not vector_db_status["is_connected"]:
+                st.warning(
+                    "⚠️ Vector database is not properly connected. Document retrieval may not work correctly."
+                )
+            # If vector DB is not compatible, show warning
+            elif not vector_db_status["is_compatible"]:
+                st.warning(
+                    "⚠️ Vector database version may not be compatible. This could cause errors or unexpected behavior."
+                )
+        else:
+            st.error("RAG API server is not responding correctly. Please start the server.")
+            with st.expander("How to Start the RAG API Server"):
+                st.markdown("""
+                ### Starting the RAG API Server
+                
+                1. **Open a terminal/command prompt**
+                2. **Navigate to your project directory**
+                3. **Run one of the following commands**:
+                ```
+                python -m scripts.serve
+                ```
+                
+                Or if you have Make installed:
+                ```
+                make rag
+                ```
+                """)
+            return
+    except requests.exceptions.RequestException:
+        st.error("RAG API server is not running. Please start the server.")
+        with st.expander("How to Start the RAG API Server"):
+            st.markdown("""
+            ### Starting the RAG API Server
+            
+            1. **Open a terminal/command prompt**
+            2. **Navigate to your project directory**
+            3. **Run one of the following commands**:
+            ```
+            python -m scripts.serve
+            ```
+            
+            Or if you have Make installed:
+            ```
+            make rag
+            ```
+            """)
+        return
+    
+    # Check if persistent vector store exists (legacy check)
+    if not os.path.exists(CHROMA_PERSIST_DIRECTORY) and not vector_db_status["in_memory"]:
+        st.warning(
+            "⚠️ No vector database directory found. If you're not using in-memory mode, please ingest documents first in the 'Convert Documents' tab."
+        )
+    
+    # Initialize session state for query history
+    if "query_history" not in st.session_state:
+        st.session_state.query_history = []
+    
+    # RAG System settings
+    with st.expander("RAG Settings", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            lob = st.selectbox(
+                "Domain/Topic",
+                ["general", "insurance", "finance", "healthcare", "legal", "technology", "education"],
+                help="Select the domain or topic for better context retrieval"
+            )
+        with col2:
+            top_k = st.slider(
+                "Number of Documents",
+                min_value=1,
+                max_value=20,
+                value=settings.top_k,
+                help="Number of relevant documents to retrieve for context"
+            )
+    
+    # Query input
+    query = st.text_area(
+        "Enter your query",
+        height=100,
+        placeholder="Enter your question here..."
+    )
+    
+    # Submit button
+    col1, col2 = st.columns([1, 10])
+    with col1:
+        submit_button = st.button("Ask", type="primary")
+    with col2:
+        clear_button = st.button("Clear History")
+    
+    # Reset history if clear button is clicked
+    if clear_button:
+        st.session_state.query_history = []
+        st.rerun()
+    
+    # Handle query submission
+    if submit_button and query:
+        with st.spinner("Searching for information..."):
+            try:
+                # First, check if the server is running
+                try:
+                    health_response = requests.get(f"http://localhost:{FASTAPI_PORT}/health", timeout=2)
+                    if health_response.status_code != 200:
+                        st.error("RAG API server is not responding correctly. Please start the server.")
+                        with st.expander("How to Start the RAG API Server"):
+                            st.markdown("""
+                            ### Starting the RAG API Server
+                            
+                            1. **Open a terminal/command prompt**
+                            2. **Navigate to your project directory**
+                            3. **Run one of the following commands**:
+                            ```
+                            python -m scripts.serve
+                            ```
+                            
+                            Or if you have Make installed:
+                            ```
+                            make rag
+                            ```
+                            """)
+                        return
+                except requests.exceptions.RequestException:
+                    st.error("RAG API server is not running. Please start the server.")
+                    with st.expander("How to Start the RAG API Server"):
+                        st.markdown("""
+                        ### Starting the RAG API Server
+                        
+                        1. **Open a terminal/command prompt**
+                        2. **Navigate to your project directory**
+                        3. **Run one of the following commands**:
+                        ```
+                        python -m scripts.serve
+                        ```
+                        
+                        Or if you have Make installed:
+                        ```
+                        make rag
+                        ```
+                        """)
+                    return
+                
+                # Generate a test token
+                token_response = requests.get(
+                    f"http://localhost:{FASTAPI_PORT}/debug/token",
+                    params={"lob": lob}
+                )
+                
+                if token_response.status_code != 200:
+                    st.error(f"Failed to authenticate: {token_response.text}")
+                    return
+                
+                token = token_response.json().get("token")
+                
+                # Make the query request with the correct parameter names
+                response = requests.post(
+                    f"http://localhost:{FASTAPI_PORT}/query",
+                    json={
+                        "question": query,
+                        "lob": lob,
+                        "k": top_k
+                    },
+                    headers={"Authorization": f"Bearer {token}"}
+                )
+                
+                if response.status_code != 200:
+                    st.error(f"Error: {response.text}")
+                    return
+                
+                result = response.json()
+                
+                # Add to history
+                st.session_state.query_history.append({
+                    "query": query,
+                    "answer": result["answer"],
+                    "metadata": result.get("metadata", {}),
+                    "sources": result.get("sources", [])
+                })
+                
+            except Exception as e:
+                st.error(f"Error querying RAG system: {str(e)}")
+                st.info("Make sure the RAG API server is running. You can start it with: `python -m scripts.serve` or `make rag`")
+                
+                # Show how to start the server
+                with st.expander("How to Start the RAG API Server"):
+                    st.markdown("""
+                    ### Starting the RAG API Server
+                    
+                    1. **Open a terminal/command prompt**
+                    2. **Navigate to your project directory**
+                    3. **Run one of the following commands**:
+                    ```
+                    python -m scripts.serve
+                    ```
+                    
+                    Or if you have Make installed:
+                    ```
+                    make rag
+                    ```
+                    
+                    This will start the FastAPI server that handles RAG queries. Keep this terminal window open while using the RAG system.
+                    
+                    After starting the server, come back and refresh this page.
+                    """)
+    
+    # Display query history
+    if st.session_state.query_history:
+        st.subheader("Conversation History")
+        
+        for i, item in enumerate(reversed(st.session_state.query_history)):
+            with st.container(border=True):
+                st.markdown(f"**Question:**")
+                st.markdown(item["query"])
+                st.markdown("**Answer:**")
+                st.markdown(item["answer"])
+                
+                # Show sources if available
+                if "sources" in item and item["sources"]:
+                    with st.expander("Sources"):
+                        for idx, source in enumerate(item["sources"]):
+                            st.markdown(f"{idx+1}. {source}")
+                
+                # Show metadata if available
+                if "metadata" in item and item["metadata"]:
+                    with st.expander("Metadata"):
+                        st.json(item["metadata"])
+    
+    # Show documentation and tips
+    with st.expander("📚 Documentation & Tips"):
+        st.markdown("""
+        ### Query RAG System
+        
+        This tab allows you to query the RAG (Retrieval-Augmented Generation) system. The system:
+        
+        1. **Retrieves relevant documents** from your vector database based on your query
+        2. **Combines the retrieved context** with your query
+        3. **Generates an answer** using the DeepSeek LLM enhanced with the retrieved context
+        
+        ### Tips for Best Results
+        
+        - **Be specific**: Specific questions tend to yield more accurate results
+        - **Domain Selection**: Select the appropriate domain/topic for better context retrieval
+        - **Document Count**: Increase the number of retrieved documents for broader context or decrease for more focused answers
+        
+        ### Troubleshooting
+        
+        - **No Results**: Make sure you have ingested documents in the 'Convert Documents' tab
+        - **Poor Quality Answers**: Try adjusting the domain or number of documents
+        - **Service Unavailable**: Ensure the RAG API server is running with `python -m scripts.serve` or `make rag`
+        """)
 
 def fine_tune_tab():
     """Tab for fine-tuning models."""
