@@ -20,6 +20,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import torch
 from streamlit_extras.add_vertical_space import add_vertical_space
 from streamlit_extras.colored_header import colored_header
 from streamlit_extras.app_logo import add_logo
@@ -37,6 +38,7 @@ from scripts.convert_to_sharegpt import (
     check_llm_availability
 )
 from core.settings import settings, DATA_DIR, OLLAMA_BASE_URL, CHROMA_PERSIST_DIRECTORY, FASTAPI_PORT
+from document_manager import document_manager_tab
 
 # Constants for memory management
 MAX_MEMORY_PERCENT = 80  # Maximum memory usage percentage
@@ -538,6 +540,13 @@ def convert_documents_tab():
         "The system will process the documents, generate questions, and create conversation pairs."
     )
     
+    # Initialize session state variables
+    if "processing_in_progress" not in st.session_state:
+        st.session_state.processing_in_progress = False
+    
+    if "processed_chunks" not in st.session_state:
+        st.session_state.processed_chunks = []
+    
     # Get system status for memory-aware parameter suggestions
     status = check_system_status()
     memory_usage = status["memory"]["percent"]
@@ -965,7 +974,7 @@ def convert_documents_tab():
             display_chunks_table(
                 st.session_state.processed_chunks,
                 processing_in_progress=st.session_state.processing_in_progress,
-                current_chunk_index=st.session_state.progress_data['current_chunk']
+                current_chunk_index=st.session_state.progress_data['current_chunk_index']
             )
     
     elif submit_button:
@@ -1305,7 +1314,7 @@ def query_rag_tab():
         """)
 
 def fine_tune_tab():
-    """Tab for fine-tuning models."""
+    """Tab for fine-tuning models using LoRA/QLoRA."""
     st.markdown("## 🧠 Fine-tune Model")
     
     if not check_llm_availability():
@@ -1314,7 +1323,434 @@ def fine_tune_tab():
         )
         return
     
-    st.markdown("Coming soon! This tab will provide an interface for fine-tuning models.")
+    # Initialize session state for fine-tuning
+    if 'ft_target_model' not in st.session_state:
+        st.session_state.ft_target_model = settings.model_name
+    if 'ft_dataset_path' not in st.session_state:
+        st.session_state.ft_dataset_path = settings.training_dataset_path
+    if 'ft_output_path' not in st.session_state:
+        st.session_state.ft_output_path = settings.output_dir
+    if 'ft_job_status' not in st.session_state:
+        st.session_state.ft_job_status = None
+    if 'ft_job_log' not in st.session_state:
+        st.session_state.ft_job_log = []
+    if 'ft_uploaded_data' not in st.session_state:
+        st.session_state.ft_uploaded_data = None
+    
+    # Create columns for the layout
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        # Model & Training Data section
+        st.subheader("Model & Training Data")
+        
+        # Model selection
+        available_models = get_available_models()
+        model = st.selectbox(
+            "Target Model",
+            available_models,
+            index=available_models.index(st.session_state.ft_target_model) if st.session_state.ft_target_model in available_models else 0,
+            help="Select a DeepSeek model to fine-tune"
+        )
+        st.session_state.ft_target_model = model
+        
+        # Data source selection
+        data_source = st.radio(
+            "Data Source",
+            ["Use Existing Dataset", "Upload New Dataset", "Use Converted Documents"],
+            index=0,
+            help="Choose where to get training data from"
+        )
+        
+        if data_source == "Use Existing Dataset":
+            # List datasets from finetune/dataset directory
+            dataset_dir = "finetune/dataset"
+            if os.path.exists(dataset_dir):
+                datasets = [f for f in os.listdir(dataset_dir) if f.endswith('.json')]
+                if datasets:
+                    dataset_name = st.selectbox(
+                        "Select Dataset",
+                        datasets,
+                        index=0,
+                        help="Choose an existing dataset for fine-tuning"
+                    )
+                    st.session_state.ft_dataset_path = os.path.join(dataset_dir, dataset_name)
+                    
+                    # Show dataset preview
+                    try:
+                        with open(st.session_state.ft_dataset_path, 'r') as f:
+                            dataset = json.load(f)
+                            with st.expander("Dataset Preview"):
+                                display_sharegpt_preview(dataset, max_display=3)
+                    except Exception as e:
+                        st.error(f"Error loading dataset preview: {str(e)}")
+                else:
+                    st.info("No datasets found in finetune/dataset directory.")
+            else:
+                st.info("finetune/dataset directory not found.")
+        
+        elif data_source == "Upload New Dataset":
+            uploaded_file = st.file_uploader(
+                "Upload ShareGPT Format Dataset (JSON)",
+                type=['json'],
+                help="Upload a dataset in ShareGPT format"
+            )
+            
+            if uploaded_file:
+                # Save the uploaded file to a temporary location
+                try:
+                    dataset_content = uploaded_file.getvalue().decode('utf-8')
+                    dataset = json.loads(dataset_content)
+                    
+                    # Create temporary directory if it doesn't exist
+                    os.makedirs("finetune/temp", exist_ok=True)
+                    
+                    # Save to temporary file
+                    temp_path = os.path.join("finetune/temp", uploaded_file.name)
+                    with open(temp_path, 'w') as f:
+                        f.write(dataset_content)
+                    
+                    st.session_state.ft_dataset_path = temp_path
+                    st.session_state.ft_uploaded_data = dataset
+                    
+                    # Show dataset preview
+                    with st.expander("Dataset Preview"):
+                        display_sharegpt_preview(dataset, max_display=3)
+                    
+                    st.success(f"Successfully uploaded dataset with {len(dataset)} conversation examples.")
+                except Exception as e:
+                    st.error(f"Error processing uploaded file: {str(e)}")
+        
+        elif data_source == "Use Converted Documents":
+            st.info("This option allows you to use documents converted in the 'Convert Documents' tab.")
+            if 'sharegpt_data' in st.session_state and st.session_state.sharegpt_data:
+                # Save the data to a file
+                try:
+                    dataset = st.session_state.sharegpt_data
+                    
+                    # Create temporary directory if it doesn't exist
+                    os.makedirs("finetune/temp", exist_ok=True)
+                    
+                    # Generate a filename based on current time
+                    import time
+                    timestamp = int(time.time())
+                    temp_path = os.path.join("finetune/temp", f"converted_docs_{timestamp}.json")
+                    
+                    with open(temp_path, 'w') as f:
+                        json.dump(dataset, f, indent=2)
+                    
+                    st.session_state.ft_dataset_path = temp_path
+                    
+                    # Show dataset preview
+                    with st.expander("Dataset Preview"):
+                        display_sharegpt_preview(dataset, max_display=3)
+                    
+                    st.success(f"Successfully prepared dataset with {len(dataset)} conversation examples.")
+                except Exception as e:
+                    st.error(f"Error processing converted documents: {str(e)}")
+            else:
+                st.warning("No converted documents found. Please convert documents in the 'Convert Documents' tab first.")
+    
+    with col2:
+        # Fine-tuning Parameters
+        st.subheader("Training Parameters")
+        
+        # Create two columns for parameters
+        param_col1, param_col2 = st.columns(2)
+        
+        with param_col1:
+            learning_rate = st.text_input(
+                "Learning Rate",
+                value=str(settings.learning_rate),
+                help="Learning rate for training (e.g. 2e-5)"
+            )
+            
+            batch_size = st.number_input(
+                "Batch Size",
+                min_value=1,
+                max_value=32,
+                value=settings.batch_size,
+                help="Batch size per device"
+            )
+            
+            num_epochs = st.number_input(
+                "Epochs",
+                min_value=1,
+                max_value=10,
+                value=settings.num_epochs,
+                help="Number of training epochs"
+            )
+            
+            use_lora = st.checkbox(
+                "Use LoRA",
+                value=True,
+                help="Use Low-Rank Adaptation for efficient fine-tuning"
+            )
+        
+        with param_col2:
+            if use_lora:
+                lora_r = st.number_input(
+                    "LoRA Rank",
+                    min_value=1,
+                    max_value=256,
+                    value=64,
+                    help="LoRA attention dimension"
+                )
+                
+                lora_alpha = st.number_input(
+                    "LoRA Alpha",
+                    min_value=1,
+                    max_value=512,
+                    value=128,
+                    help="LoRA alpha parameter"
+                )
+                
+                lora_dropout = st.number_input(
+                    "LoRA Dropout",
+                    min_value=0.0,
+                    max_value=0.9,
+                    value=0.05,
+                    step=0.01,
+                    help="LoRA dropout probability"
+                )
+        
+        # Output directory
+        output_dir = st.text_input(
+            "Output Directory",
+            value=settings.output_dir,
+            help="Directory to save the fine-tuned model"
+        )
+        st.session_state.ft_output_path = output_dir
+        
+        # Optional parameters in expandable section
+        with st.expander("Advanced Parameters"):
+            use_4bit = st.checkbox(
+                "Use 4-bit Quantization",
+                value=torch.cuda.is_available(),
+                help="Enable 4-bit quantization (QLoRA)"
+            )
+            
+            gradient_accumulation_steps = st.number_input(
+                "Gradient Accumulation Steps",
+                min_value=1,
+                max_value=32,
+                value=settings.gradient_accumulation_steps,
+                help="Number of gradient accumulation steps"
+            )
+            
+            max_seq_length = st.number_input(
+                "Max Sequence Length",
+                min_value=128,
+                max_value=4096,
+                value=settings.context_window if settings.context_window < 4096 else 2048,
+                help="Maximum sequence length for training"
+            )
+    
+    # Hardware information
+    st.subheader("Hardware Information")
+    
+    hardware_col1, hardware_col2 = st.columns(2)
+    
+    with hardware_col1:
+        # Show GPU information if available
+        if torch.cuda.is_available():
+            gpu_info = f"GPU: {torch.cuda.get_device_name(0)}"
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            st.success(f"✅ {gpu_info} ({gpu_memory:.1f} GB)")
+        else:
+            st.warning("❌ No GPU detected. Fine-tuning will be very slow on CPU.")
+        
+        # Show RAM information
+        memory = psutil.virtual_memory()
+        ram_total = memory.total / (1024**3)
+        st.info(f"RAM: {ram_total:.1f} GB total, {memory.percent}% used")
+    
+    with hardware_col2:
+        # Show disk information
+        disk = psutil.disk_usage('/')
+        disk_total = disk.total / (1024**3)
+        st.info(f"Disk: {disk_total:.1f} GB total, {disk.percent}% used")
+        
+        # Show PyTorch information
+        st.info(f"PyTorch: {torch.__version__}")
+    
+    # Start fine-tuning button
+    if st.button("Start Fine-tuning", type="primary"):
+        # Validate inputs
+        if not os.path.exists(st.session_state.ft_dataset_path):
+            st.error(f"Dataset file not found: {st.session_state.ft_dataset_path}")
+        else:
+            # Create output directory if it doesn't exist
+            os.makedirs(st.session_state.ft_output_path, exist_ok=True)
+            
+            # Build command
+            if platform.system() == "Windows":
+                script_path = "scripts\\finetune.ps1"
+            else:
+                script_path = "scripts/finetune.sh"
+            
+            # Check if script exists
+            if not os.path.exists(script_path):
+                st.error(f"Fine-tuning script not found: {script_path}")
+                return
+            
+            # Set parameters
+            params = {
+                "model_name": st.session_state.ft_target_model,
+                "dataset_path": st.session_state.ft_dataset_path,
+                "output_dir": st.session_state.ft_output_path,
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "num_epochs": num_epochs,
+                "lora_r": lora_r if use_lora else 0,
+                "lora_alpha": lora_alpha if use_lora else 0,
+                "lora_dropout": lora_dropout if use_lora else 0,
+                "use_lora": use_lora,
+                "use_4bit": use_4bit,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "max_seq_length": max_seq_length
+            }
+            
+            # Create a unique job ID
+            import time
+            job_id = int(time.time())
+            
+            # Start fine-tuning in a background thread to not block UI
+            st.session_state.ft_job_status = "running"
+            st.session_state.ft_job_log = ["Starting fine-tuning job..."]
+            
+            def run_fine_tuning():
+                try:
+                    # Import subprocess here to prevent streamlit from trying to pickle it
+                    import subprocess
+                    
+                    # Build command based on platform
+                    if platform.system() == "Windows":
+                        cmd = ["powershell", "-File", script_path]
+                    else:
+                        cmd = ["bash", script_path]
+                    
+                    # Add parameters
+                    for key, value in params.items():
+                        cmd.append(f"--{key}")
+                        cmd.append(str(value))
+                    
+                    # Run process
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1
+                    )
+                    
+                    # Read output line by line
+                    for line in iter(process.stdout.readline, ''):
+                        if not line:
+                            break
+                        # Append to log
+                        st.session_state.ft_job_log.append(line.strip())
+                    
+                    # Wait for process to complete
+                    exit_code = process.wait()
+                    
+                    if exit_code == 0:
+                        st.session_state.ft_job_status = "completed"
+                        st.session_state.ft_job_log.append("Fine-tuning completed successfully!")
+                    else:
+                        st.session_state.ft_job_status = "failed"
+                        st.session_state.ft_job_log.append(f"Fine-tuning failed with exit code {exit_code}")
+                
+                except Exception as e:
+                    st.session_state.ft_job_status = "failed"
+                    st.session_state.ft_job_log.append(f"Error running fine-tuning: {str(e)}")
+            
+            # Start the background thread
+            import threading
+            thread = threading.Thread(target=run_fine_tuning)
+            thread.daemon = True
+            thread.start()
+            
+            # Force refresh to show status
+            st.rerun()
+    
+    # Display job status and log if a job is running
+    if st.session_state.ft_job_status:
+        st.subheader("Fine-tuning Job Status")
+        
+        # Status indicator
+        if st.session_state.ft_job_status == "running":
+            st.info("⏳ Fine-tuning in progress...")
+        elif st.session_state.ft_job_status == "completed":
+            st.success("✅ Fine-tuning completed successfully!")
+        elif st.session_state.ft_job_status == "failed":
+            st.error("❌ Fine-tuning failed!")
+        
+        # Show log in expander
+        with st.expander("View Fine-tuning Log", expanded=True):
+            log_text = "\n".join(st.session_state.ft_job_log[-100:])  # Show last 100 lines
+            st.code(log_text)
+        
+        # Add refresh button
+        if st.button("Refresh Status"):
+            st.rerun()
+        
+        # Add clear button if job is not running
+        if st.session_state.ft_job_status != "running":
+            if st.button("Clear Status"):
+                st.session_state.ft_job_status = None
+                st.session_state.ft_job_log = []
+                st.rerun()
+    
+    # Documentation
+    with st.expander("📚 Fine-tuning Documentation", expanded=False):
+        st.markdown("""
+        ### Model Fine-tuning
+        
+        Fine-tuning allows you to adapt a DeepSeek model to your specific domain or tasks, improving its performance for your use case.
+        
+        #### Training Data Requirements
+        
+        Training data must be in ShareGPT format, which is a JSON array of conversation objects:
+        
+        ```json
+        [
+          {
+            "conversations": [
+              {"from": "system", "value": "System prompt (optional)"},
+              {"from": "human", "value": "User message"},
+              {"from": "assistant", "value": "Assistant response"},
+              ...
+            ]
+          },
+          ...
+        ]
+        ```
+        
+        #### Fine-tuning Methods
+        
+        This system offers two fine-tuning approaches:
+        
+        1. **LoRA (Low-Rank Adaptation)**: Efficient fine-tuning with few parameters
+        2. **QLoRA (Quantized LoRA)**: Uses 4-bit quantization for even more efficient fine-tuning
+        
+        #### Parameters
+        
+        - **Learning Rate**: How quickly the model adapts (typical values: 1e-5 to 5e-5)
+        - **Batch Size**: Number of examples processed at once
+        - **Epochs**: Number of passes through the entire dataset
+        - **LoRA Rank**: Higher values give more capacity but use more memory
+        - **LoRA Alpha**: Scaling factor for LoRA updates
+        
+        #### Hardware Requirements
+        
+        - **For 7B models**: At least 16GB VRAM with 4-bit quantization
+        - **For CPU-only**: Not recommended, but possible for small models and datasets
+        
+        #### After Fine-tuning
+        
+        The fine-tuned model will be saved to the output directory specified. You can use it for inference in the Query RAG tab.
+        """)
 
 def app_settings_tab():
     """Tab for app settings."""
@@ -1400,6 +1836,7 @@ def main():
     # Create tabs
     tabs = st.tabs([
         "📄 Convert Documents", 
+        "📑 Document Management",
         "🔍 Query RAG", 
         "🧠 Fine-tune Model", 
         "⚙️ Settings"
@@ -1410,12 +1847,15 @@ def main():
         convert_documents_tab()
     
     with tabs[1]:
-        query_rag_tab()
+        document_manager_tab()
     
     with tabs[2]:
-        fine_tune_tab()
+        query_rag_tab()
     
     with tabs[3]:
+        fine_tune_tab()
+    
+    with tabs[4]:
         app_settings_tab()
     
     # Footer
