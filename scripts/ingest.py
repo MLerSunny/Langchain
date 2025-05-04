@@ -1,38 +1,21 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
-Document ingestion script.
-
-This script handles loading documents from various sources,
-chunking them, embedding them, and storing them in a vector database.
+Script for ingesting documents and creating vector embeddings for RAG.
 """
 
-import argparse
-import logging
 import os
 import sys
-from typing import List, Optional
+import logging
+from typing import List, Dict, Any, Optional
 
-import chromadb
-from langchain.document_loaders import (
-    CSVLoader,
-    DirectoryLoader,
-    PDFMinerLoader,
-    PyPDFLoader,
-    TextLoader,
-    UnstructuredHTMLLoader,
-    UnstructuredMarkdownLoader,
-)
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
-
+# Add the project root to Python path to import project modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.settings import (
-    CHROMA_PERSIST_DIRECTORY,
-    CHUNK_OVERLAP,
-    CHUNK_SIZE,
-    EMBEDDING_MODEL,
-)
+
+from langchain_core.documents import Document
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+from core.settings import CHROMA_PERSIST_DIRECTORY
 
 # Configure logging
 logging.basicConfig(
@@ -41,199 +24,90 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Map file extensions to document loaders
-LOADER_MAPPING = {
-    ".csv": (CSVLoader, {}),
-    ".html": (UnstructuredHTMLLoader, {}),
-    ".md": (UnstructuredMarkdownLoader, {}),
-    ".pdf": (PyPDFLoader, {}),
-    ".txt": (TextLoader, {"encoding": "utf8"}),
-}
-
-
-def load_documents(source_dir: str) -> List:
+def create_vector_db_from_documents(
+    documents: List[Document],
+    persist_directory: Optional[str] = CHROMA_PERSIST_DIRECTORY,
+    embedding_model_name: str = "all-MiniLM-L6-v2"
+) -> Any:
     """
-    Load documents from the specified directory.
-
+    Create a vector database from documents and persist it to disk.
+    
     Args:
-        source_dir: Path to the directory containing documents.
-
+        documents: List of documents to add to vector store
+        persist_directory: Directory to persist the vector store
+        embedding_model_name: Name of the embedding model to use
+    
     Returns:
-        List of loaded documents.
+        The Chroma vector store object
     """
-    if not os.path.exists(source_dir):
-        logger.error(f"Directory '{source_dir}' does not exist")
-        sys.exit(1)
-
-    all_files = []
-    for root, _, files in os.walk(source_dir):
-        for file in files:
-            # Skip hidden files
-            if file.startswith("."):
-                continue
-                
-            file_path = os.path.join(root, file)
-            file_ext = os.path.splitext(file_path)[1].lower()
-            
-            if file_ext in LOADER_MAPPING:
-                all_files.append(file_path)
-                
-    if not all_files:
-        logger.error(f"No supported documents found in '{source_dir}'")
-        sys.exit(1)
-        
-    logger.info(f"Found {len(all_files)} files to process")
-    
-    # Load documents using the appropriate loader
-    documents = []
-    for file_path in all_files:
-        file_ext = os.path.splitext(file_path)[1].lower()
-        if file_ext in LOADER_MAPPING:
-            loader_class, loader_args = LOADER_MAPPING[file_ext]
-            try:
-                logger.info(f"Loading '{file_path}'")
-                loader = loader_class(file_path, **loader_args)
-                documents.extend(loader.load())
-            except Exception as e:
-                logger.error(f"Error loading '{file_path}': {e}")
-    
-    return documents
-
-
-def process_documents(
-    documents: List,
-    chunk_size: int = CHUNK_SIZE,
-    chunk_overlap: int = CHUNK_OVERLAP,
-) -> List:
-    """
-    Process documents by splitting them into chunks.
-
-    Args:
-        documents: List of documents to process.
-        chunk_size: Size of each chunk.
-        chunk_overlap: Overlap between chunks.
-
-    Returns:
-        List of processed document chunks.
-    """
-    if not documents:
-        logger.error("No documents to process")
-        sys.exit(1)
-        
-    logger.info(f"Splitting {len(documents)} documents into chunks")
-    
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-    )
-    
-    chunks = text_splitter.split_documents(documents)
-    logger.info(f"Split into {len(chunks)} chunks")
-    
-    return chunks
-
-
-def create_vectorstore(
-    chunks: List,
-    persist_directory: str = CHROMA_PERSIST_DIRECTORY,
-    embedding_model_name: str = EMBEDDING_MODEL,
-) -> None:
-    """
-    Create a vector store from the document chunks.
-
-    Args:
-        chunks: List of document chunks.
-        persist_directory: Directory to persist the vector store.
-        embedding_model_name: Name of the embedding model to use.
-    """
-    if not chunks:
-        logger.error("No chunks to embed")
-        sys.exit(1)
-        
-    logger.info(f"Creating embeddings using '{embedding_model_name}'")
+    logger.info(f"Creating vector database at {persist_directory} with {len(documents)} documents")
     
     # Create directory if it doesn't exist
     os.makedirs(persist_directory, exist_ok=True)
     
-    # Create embeddings
+    # Initialize the embedding function
     embeddings = HuggingFaceEmbeddings(model_name=embedding_model_name)
     
-    # Create and persist a Chroma vector store
-    logger.info(f"Creating vector store at '{persist_directory}'")
-    try:
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=persist_directory,
-        )
-        vectorstore.persist()
-        logger.info(f"Vector store created successfully with {len(chunks)} documents")
-    except Exception as e:
-        logger.error(f"Error creating vector store: {e}")
-        sys.exit(1)
-
+    # Create and persist the vector store
+    vectorstore = Chroma.from_documents(
+        documents=documents,
+        embedding=embeddings,
+        persist_directory=persist_directory
+    )
+    
+    # Persist the vector store
+    vectorstore.persist()
+    
+    logger.info(f"Vector database created with {len(documents)} documents and persisted to {persist_directory}")
+    
+    return vectorstore
 
 def main():
-    """Main function to run the ingestion process."""
+    """
+    Main function for ingesting documents from command line.
+    """
+    import argparse
+    
     parser = argparse.ArgumentParser(
-        description="Ingest documents into a vector database"
+        description="Ingest documents and create vector embeddings for RAG"
     )
+    
     parser.add_argument(
-        "--source",
-        "-s",
+        "--input-dir",
         type=str,
         required=True,
-        help="Source directory containing documents to ingest",
+        help="Directory containing documents to process"
     )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=CHUNK_SIZE,
-        help=f"Chunk size for document splitting (default: {CHUNK_SIZE})",
-    )
-    parser.add_argument(
-        "--chunk-overlap",
-        type=int,
-        default=CHUNK_OVERLAP,
-        help=f"Chunk overlap for document splitting (default: {CHUNK_OVERLAP})",
-    )
+    
     parser.add_argument(
         "--persist-dir",
         type=str,
         default=CHROMA_PERSIST_DIRECTORY,
-        help=f"Directory to persist vector store (default: {CHROMA_PERSIST_DIRECTORY})",
+        help="Directory to persist vector store"
     )
+    
     parser.add_argument(
         "--embedding-model",
         type=str,
-        default=EMBEDDING_MODEL,
-        help=f"Embedding model to use (default: {EMBEDDING_MODEL})",
+        default="all-MiniLM-L6-v2",
+        help="Name of the embedding model to use"
     )
     
     args = parser.parse_args()
     
-    logger.info("Starting document ingestion process")
+    # Import here to avoid circular imports
+    from convert_to_sharegpt import load_documents, split_documents
     
-    # Load documents
-    documents = load_documents(args.source)
+    # Load and split documents
+    documents = load_documents(args.input_dir)
+    chunks = split_documents(documents)
     
-    # Process documents
-    chunks = process_documents(
-        documents,
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap,
-    )
-    
-    # Create and persist vector store
-    create_vectorstore(
-        chunks,
+    # Create vector store
+    create_vector_db_from_documents(
+        documents=chunks,
         persist_directory=args.persist_dir,
-        embedding_model_name=args.embedding_model,
+        embedding_model_name=args.embedding_model
     )
-    
-    logger.info("Document ingestion completed successfully")
-
 
 if __name__ == "__main__":
     main() 

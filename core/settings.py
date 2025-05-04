@@ -14,12 +14,12 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     
     # JWT Settings
-    jwt_secret: str = "CHANGE_ME_IN_PRODUCTION"
+    jwt_secret: str = "ypzkQRSJB3QxTBF95c8KwDjgcPrEmn7v"  # Default value that can be overridden by env
     jwt_algorithm: str = "HS256"
     
     # Model settings
-    model_name: str = "deepseek-coder:7b-instruct-v1.5"
-    default_model: str = "deepseek-coder:7b-instruct-v1.5"
+    model_name: str = "deepseek-llm:7b"
+    default_model: str = "deepseek-llm:7b"
     ollama_base_url: str = "http://localhost:11434"
     context_window: int = 8192
     max_tokens: int = 2048
@@ -102,12 +102,6 @@ if not os.path.isabs(settings.data_path):
 if not os.path.isabs(settings.deepspeed_config_path):
     settings.deepspeed_config_path = get_abs_path(settings.deepspeed_config_path)
 
-# Validation check for JWT secret
-# Comment out for training to proceed
-# assert settings.jwt_secret != "CHANGE_ME_IN_PRODUCTION", (
-#     "Set JWT_SECRET in .env before running!")
-settings.jwt_secret = "ypzkQRSJB3QxTBF95c8KwDjgcPrEmn7v"
-
 # Load RAG configuration from YAML if it exists
 RAG_CONFIG = {}
 try:
@@ -134,7 +128,10 @@ if "document_processing" in RAG_CONFIG:
         "chunk_overlap", settings.chunk_overlap
     )
 
-# Removed duplicate uppercase constants
-# Import this settings object and access properties directly instead
-# For example: from core.settings import settings
-# Then use: settings.chunk_size instead of CHUNK_SIZE 
+# Export constants for backward compatibility
+BASE_DIR = settings.base_dir
+DATA_DIR = settings.data_dir
+FASTAPI_PORT = settings.fastapi_port
+HOST = settings.host
+CHROMA_PERSIST_DIRECTORY = settings.chroma_persist_directory
+OLLAMA_BASE_URL = settings.ollama_base_url 

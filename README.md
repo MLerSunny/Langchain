@@ -381,3 +381,40 @@ The fine-tuning script accepts the following parameters:
 ## Output
 
 The trained model will be saved in the output directory specified by `-outputDir`. The model can then be used for inference or further fine-tuning.
+
+## Recent Fixes
+
+### ShareGPT Conversion Improvements
+- Added proper progress bars for both document chunking and ShareGPT creation processes
+- Fixed progress tracking to show accurate counts during processing
+- Improved thread-safe progress updates with a queue-based mechanism
+- Enhanced display of processing status for better user feedback
+
+### Query RAG System Fixes
+- Fixed the API request payload format to use JSON instead of query parameters
+- Added server health check before attempting queries
+- Improved error handling and feedback for when the RAG server is unavailable
+- Enhanced source document extraction and formatting in results
+- Fixed metadata filtering in vector database queries
+- Added proper display of source documents in the UI
+- Improved error handling in context retrieval
+
+These improvements make the system more robust and user-friendly, with better visual feedback during document processing and more reliable RAG query functionality.
+
+## Using vLLM for Inference
+
+The project now includes a vLLM server in the Docker setup for faster inference. To use it:
+
+1. Make sure you have a compatible GPU with CUDA support
+2. Download a model to the `models` directory (e.g., mistral-7b-instruct-v0.2)
+3. Start all services with Docker Compose:
+   ```bash
+   docker-compose up -d
+   ```
+
+You can specify a different model path using the MODEL_PATH environment variable:
+```bash
+MODEL_PATH=/models/your-custom-model docker-compose up -d
+```
+
+By default, the vLLM service will listen on port 8001 and the API will connect to it automatically.

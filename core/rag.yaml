@@ -9,20 +9,20 @@ document_processing:
 # Vector database
 vector_db:
   type: "${vector_db}"
-  persist_directory: ".chroma"
+  persist_directory: "data/chroma"
   collection_name: "insurance_docs"
   distance_function: "cosine"
 
 # Retrieval
 retriever:
   search_type: "mmr"  # Maximum Marginal Relevance to balance relevance and diversity
-  k: 8               # Number of documents to retrieve
+  k: 2               # Number of documents to retrieve
   lambda_mult: 0.3   # Diversity vs. relevance balance (lower = more diverse)
-  fetch_k: 20        # Initial number of docs to fetch before reranking
+  fetch_k: 2        # Initial number of docs to fetch before reranking
 
 # LLM
 llm:
-  model_name: "deepseek-coder:7b-instruct-v1.5"
+  model_name: "deepseek-llm:7b"
   max_tokens: 2048
   temperature: 0.2
   top_p: 0.95

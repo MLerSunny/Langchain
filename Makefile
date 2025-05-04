@@ -1,6 +1,6 @@
 # Makefile for RAG + Fine-tuning Project
 
-.PHONY: setup ingest serve finetune test clean help docker-build docker-up docker-down lint install-hooks streamlit
+.PHONY: setup ingest serve finetune test clean help docker-build docker-up docker-down lint install-hooks streamlit rag
 
 # Default Python command
 PYTHON = python
@@ -14,13 +14,14 @@ STREAMLIT_PORT = 8501
 SOURCE_DIR = data/raw
 TRAIN_DATA = data/training
 EVAL_DATA = data/eval
-MODEL_NAME = deepseek-coder:7b-instruct-v1.5
+MODEL_NAME = deepseek-llm:7b
 
 help:
 	@echo "Available commands:"
 	@echo "  setup         - Run setup script to install dependencies"
 	@echo "  ingest        - Ingest documents into the vector database"
 	@echo "  serve         - Start the FastAPI server"
+	@echo "  rag           - Start the RAG API server"
 	@echo "  vllm          - Start vLLM server"
 	@echo "  ollama        - Pull and run the DeepSeek model in Ollama"
 	@echo "  finetune      - Run fine-tuning process on DeepSeek model"
@@ -63,6 +64,11 @@ serve:
 	@echo "Starting FastAPI server on port $(FASTAPI_PORT)..."
 	bash scripts/serve.sh --port $(FASTAPI_PORT)
 endif
+
+# RAG server command
+rag:
+	@echo "Starting RAG API server on port $(FASTAPI_PORT)..."
+	$(PYTHON) -m scripts.serve
 
 vllm:
 	@echo "Starting vLLM server on port $(VLLM_PORT)..."
