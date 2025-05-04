@@ -2,109 +2,84 @@
 # Usage: .\scripts\finetune.ps1
 
 param (
-    [string]$modelName = "deepseek-r1:32b",
-    [string]$configFile = "core/deepspeed_zero3.json",
-    [string]$outputDir = "checkpoints/r1_ins_lora",
-    [int]$trainEpochs = 3,
-    [int]$batchSize = 1,
-    [int]$gradAccumSteps = 8,
-    [switch]$skipDeepSpeed = $false,
-    [switch]$useOllama = $false,
-    [string]$Target
+    [string]$model_name = "deepseek-llm:7b",
+    [string]$dataset_path = "finetune/dataset/insurance_conversations.json",
+    [string]$output_dir = "data/models",
+    [string]$learning_rate = "2e-5",
+    [int]$batch_size = 1,
+    [int]$gradient_accumulation_steps = 4,
+    [int]$num_epochs = 3,
+    [int]$max_steps = -1,
+    [int]$logging_steps = 10,
+    [int]$save_steps = 100,
+    [int]$warmup_steps = 50,
+    [int]$lora_r = 64,
+    [int]$lora_alpha = 128,
+    [float]$lora_dropout = 0.05,
+    [bool]$use_lora = $true,
+    [bool]$use_4bit = $true,
+    [int]$max_seq_length = 2048
 )
 
-# Check if using Ollama directly
-if ($useOllama -or $Target -eq "ollama") {
-    Write-Host "Using Ollama with model: $modelName" -ForegroundColor Cyan
-    Write-Host "Starting Ollama inference..."
-    python inference.py
-    exit 0
-}
+Write-Host "Starting DeepSeek-LLM fine-tuning..." -ForegroundColor Cyan
+Write-Host "Model: $model_name" -ForegroundColor Cyan
+Write-Host "Dataset: $dataset_path" -ForegroundColor Cyan
+Write-Host "Output directory: $output_dir" -ForegroundColor Cyan
 
-Write-Host "Starting LLM fine-tuning with QLoRA..." -ForegroundColor Cyan
-
-# Check if DeepSpeed is installed
-$deepspeedInstalled = $false
-try {
-    $deepspeedVersion = Invoke-Expression "deepspeed --version"
-    $deepspeedInstalled = $true
-    Write-Host "Found DeepSpeed version: $deepspeedVersion" -ForegroundColor Green
-} catch {
-    if (-not $skipDeepSpeed) {
-        Write-Host "DeepSpeed is not installed or not in your PATH!" -ForegroundColor Yellow
-        Write-Host "You can install it with: pip install deepspeed" -ForegroundColor Yellow
-        Write-Host "Or run this script with -skipDeepSpeed to use non-DeepSpeed training" -ForegroundColor Yellow
-        Write-Host "Example: .\scripts\finetune.ps1 -skipDeepSpeed" -ForegroundColor Yellow
-        exit 1
-    }
-    Write-Host "DeepSpeed not found. Using standard training instead." -ForegroundColor Yellow
-}
-
-# Ensure the config file exists if using DeepSpeed
-if (-not $skipDeepSpeed -and -not (Test-Path $configFile)) {
-    Write-Error "DeepSpeed config file $configFile does not exist!"
-    exit 1
-}
-
-# Ensure the dataset directory exists
-if (-not (Test-Path "finetune/dataset")) {
-    Write-Error "Dataset directory 'finetune/dataset' does not exist or is empty!"
+# Ensure the dataset file exists
+if (-not (Test-Path $dataset_path)) {
+    Write-Error "Dataset file $dataset_path does not exist!"
     exit 1
 }
 
 # Create output directory if it doesn't exist
-if (-not (Test-Path $outputDir)) {
-    New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
-    Write-Host "Created output directory: $outputDir"
+if (-not (Test-Path $output_dir)) {
+    New-Item -Path $output_dir -ItemType Directory -Force | Out-Null
+    Write-Host "Created output directory: $output_dir" -ForegroundColor Green
 }
 
 # Set environment variables for training
-$env:CUDA_VISIBLE_DEVICES = "0"
 $env:TOKENIZERS_PARALLELISM = "false"
 
-# Build the command
-if (-not $skipDeepSpeed -and $deepspeedInstalled) {
-    # DeepSpeed command
-    $command = "deepspeed --num_gpus=1 finetune/trainer.py " + `
-                        "--deepspeed $configFile " + `
-                        "--model_name $modelName " + `
-                        "--dataset_dir finetune/dataset " + `
-                        "--output_dir $outputDir " + `
-                        "--num_epochs $trainEpochs " + `
-                        "--batch_size $batchSize " + `
-                        "--gradient_accumulation_steps $gradAccumSteps " + `
-                        "--learning_rate 2e-4 " + `
-                        "--logging_steps 10 " + `
-                        "--save_steps 100 " + `
-                        "--warmup_steps 50 " + `
-                        "--max_seq_length 2048 " + `
-                        "--lora_r 64 " + `
-                        "--lora_alpha 128 " + `
-                        "--lora_dropout 0.05"
-} else {
-    # Standard training command without DeepSpeed
-    $command = "python finetune/trainer.py " + `
-                    "--model_name $modelName " + `
-                    "--dataset_dir finetune/dataset " + `
-                    "--output_dir $outputDir " + `
-                    "--num_epochs $trainEpochs " + `
-                    "--batch_size $batchSize " + `
-                    "--gradient_accumulation_steps $gradAccumSteps " + `
-                    "--learning_rate 2e-4 " + `
-                    "--logging_steps 10 " + `
-                    "--save_steps 100 " + `
-                    "--warmup_steps 50 " + `
-                    "--max_seq_length 2048 " + `
-                    "--lora_r 64 " + `
-                    "--lora_alpha 128 " + `
-                    "--lora_dropout 0.05"
+# Check for GPU availability
+$gpuAvailable = $false
+try {
+    $gpuInfo = nvidia-smi
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "NVIDIA GPU detected, using CUDA" -ForegroundColor Green
+        $env:CUDA_VISIBLE_DEVICES = "0"
+        $gpuAvailable = $true
+    }
+} catch {
+    Write-Host "No NVIDIA GPU detected, using CPU only (this will be slow)" -ForegroundColor Yellow
+    $use_4bit = $false
 }
 
+# Build the Python command
+$command = "python scripts/finetune.py " + `
+    "--model_name_or_path `"$model_name`" " + `
+    "--dataset_path `"$dataset_path`" " + `
+    "--output_dir `"$output_dir`" " + `
+    "--learning_rate $learning_rate " + `
+    "--per_device_train_batch_size $batch_size " + `
+    "--gradient_accumulation_steps $gradient_accumulation_steps " + `
+    "--num_train_epochs $num_epochs " + `
+    "--max_steps $max_steps " + `
+    "--logging_steps $logging_steps " + `
+    "--save_steps $save_steps " + `
+    "--warmup_steps $warmup_steps " + `
+    "--use_lora `$$use_lora " + `
+    "--lora_rank $lora_r " + `
+    "--lora_alpha $lora_alpha " + `
+    "--lora_dropout $lora_dropout " + `
+    "--use_4bit `$$use_4bit " + `
+    "--max_seq_length $max_seq_length " + `
+    "--report_to tensorboard"
+
 # Run the fine-tuning command
-Write-Host "Running: $command"
-$result = $null
+Write-Host "Running: $command" -ForegroundColor Cyan
 try {
-    $result = Invoke-Expression $command
+    Invoke-Expression $command
     $exitCode = $LASTEXITCODE
 } catch {
     Write-Host "Error running command: $_" -ForegroundColor Red
@@ -114,10 +89,8 @@ try {
 # Check if the command was successful
 if ($exitCode -eq 0) {
     Write-Host "Fine-tuning completed successfully!" -ForegroundColor Green
-    Write-Host "Model checkpoint saved to: $outputDir"
+    Write-Host "Model checkpoint saved to: $output_dir" -ForegroundColor Green
 } else {
     Write-Host "Fine-tuning failed with exit code $exitCode" -ForegroundColor Red
-    if ($result) {
-        Write-Host "Command output: $result"
-    }
+    exit 1
 } 

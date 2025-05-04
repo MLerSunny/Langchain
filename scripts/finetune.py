@@ -98,15 +98,15 @@ class DataArguments:
     """Arguments pertaining to what data we are training on."""
 
     dataset_path: str = field(
-        default=TRAINING_DATASET_PATH,
+        default="finetune/dataset/insurance_conversations.json",
         metadata={"help": "Path to the training dataset"}
     )
     eval_dataset_path: str = field(
-        default=EVAL_DATASET_PATH,
+        default="",
         metadata={"help": "Path to the evaluation dataset"}
     )
     max_seq_length: int = field(
-        default=CONTEXT_WINDOW,
+        default=2048,
         metadata={"help": "Maximum sequence length to use for training"}
     )
 
@@ -136,18 +136,101 @@ def load_and_prepare_datasets(
     # Determine the format based on file extension
     if data_args.dataset_path.endswith(".json") or data_args.dataset_path.endswith(".jsonl"):
         # Load JSON dataset
-        train_dataset = load_dataset("json", data_files=data_args.dataset_path, split="train")
+        with open(data_args.dataset_path, 'r', encoding='utf-8') as f:
+            raw_data = json.load(f)
+        
+        # Process dataset into prompt/completion format based on ShareGPT format
+        processed_data = []
+        for item in raw_data:
+            conversations = item.get("conversations", [])
+            if len(conversations) < 2:
+                continue
+                
+            # Extract system prompt if it exists
+            system_prompt = ""
+            start_idx = 0
+            if conversations[0]["from"].lower() == "system":
+                system_prompt = conversations[0]["value"]
+                start_idx = 1
+            
+            # Process conversation pairs (human -> assistant)
+            for i in range(start_idx, len(conversations) - 1, 2):
+                if i + 1 < len(conversations):
+                    if conversations[i]["from"].lower() in ["human", "user"] and \
+                       conversations[i+1]["from"].lower() in ["assistant", "gpt"]:
+                        
+                        user_prompt = conversations[i]["value"]
+                        assistant_response = conversations[i+1]["value"]
+                        
+                        # Format with system prompt if available
+                        if system_prompt:
+                            prompt = f"<|system|>\n{system_prompt}\n<|user|>\n{user_prompt}\n<|assistant|>\n"
+                        else:
+                            prompt = f"<|user|>\n{user_prompt}\n<|assistant|>\n"
+                        
+                        processed_data.append({
+                            "prompt": prompt,
+                            "completion": assistant_response
+                        })
+        
+        # Create Dataset object
+        train_dataset = Dataset.from_dict({
+            "prompt": [item["prompt"] for item in processed_data],
+            "completion": [item["completion"] for item in processed_data]
+        })
     else:
         # Assume directory structure readable by load_dataset
         train_dataset = load_dataset(data_args.dataset_path, split="train")
     
     # Load evaluation dataset if available
     eval_dataset = None
-    if os.path.exists(data_args.eval_dataset_path):
+    if data_args.eval_dataset_path and os.path.exists(data_args.eval_dataset_path):
         logger.info(f"Loading evaluation dataset from {data_args.eval_dataset_path}")
         if data_args.eval_dataset_path.endswith(".json") or data_args.eval_dataset_path.endswith(".jsonl"):
-            eval_dataset = load_dataset("json", data_files=data_args.eval_dataset_path, split="train")
+            with open(data_args.eval_dataset_path, 'r', encoding='utf-8') as f:
+                raw_eval_data = json.load(f)
+            
+            # Process using the same logic as training data
+            processed_eval_data = []
+            for item in raw_eval_data:
+                conversations = item.get("conversations", [])
+                if len(conversations) < 2:
+                    continue
+                    
+                # Extract system prompt if it exists
+                system_prompt = ""
+                start_idx = 0
+                if conversations[0]["from"].lower() == "system":
+                    system_prompt = conversations[0]["value"]
+                    start_idx = 1
+                
+                # Process conversation pairs (human -> assistant)
+                for i in range(start_idx, len(conversations) - 1, 2):
+                    if i + 1 < len(conversations):
+                        if conversations[i]["from"].lower() in ["human", "user"] and \
+                           conversations[i+1]["from"].lower() in ["assistant", "gpt"]:
+                            
+                            user_prompt = conversations[i]["value"]
+                            assistant_response = conversations[i+1]["value"]
+                            
+                            # Format with system prompt if available
+                            if system_prompt:
+                                prompt = f"<|system|>\n{system_prompt}\n<|user|>\n{user_prompt}\n<|assistant|>\n"
+                            else:
+                                prompt = f"<|user|>\n{user_prompt}\n<|assistant|>\n"
+                            
+                            processed_eval_data.append({
+                                "prompt": prompt,
+                                "completion": assistant_response
+                            })
+            
+            # Create Dataset object
+            eval_dataset = Dataset.from_dict({
+                "prompt": [item["prompt"] for item in processed_eval_data],
+                "completion": [item["completion"] for item in processed_eval_data]
+            })
         else:
+            # Assume directory structure readable by load_dataset
             eval_dataset = load_dataset(data_args.eval_dataset_path, split="train")
     
     # Define tokenization function
@@ -261,7 +344,7 @@ def train(
             r=model_args.lora_rank,
             lora_alpha=model_args.lora_alpha,
             lora_dropout=model_args.lora_dropout,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
