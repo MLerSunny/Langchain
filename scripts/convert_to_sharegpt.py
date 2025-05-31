@@ -16,14 +16,20 @@ import re
 import random
 import requests
 import threading
+import psutil
+import yaml
 from typing import List, Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from collections import defaultdict
+from sentence_transformers import SentenceTransformer
 
 # Add parent directory to path for importing config
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from langchain_community.document_loaders.pdf import PyPDFLoader
 from langchain_community.document_loaders import (
-    PyPDFLoader, 
     Docx2txtLoader, 
     CSVLoader,
     UnstructuredFileLoader,
@@ -35,12 +41,16 @@ from langchain_community.document_loaders import (
 from langchain_text_splitters import SentenceTransformersTokenTextSplitter
 from langchain_core.documents import Document
 
-from core.settings import settings, DATA_DIR, OLLAMA_BASE_URL
+from core.settings import settings, DATA_DIR, OLLAMA_BASE_URL, EMBEDDING_MODEL
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Change to DEBUG level
     format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('convert_to_sharegpt.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -55,105 +65,129 @@ PROGRESS_LOCK = threading.Lock()
 CHUNKS_PROCESSED = 0
 CURRENT_CHUNK = 0
 
-def check_llm_availability() -> bool:
-    """
-    Check if the LLM service (Ollama) is available.
+@dataclass
+class ProcessingMetrics:
+    """Class to track processing metrics"""
+    start_time: datetime = field(default_factory=datetime.now)
+    total_documents: int = 0
+    processed_documents: int = 0
+    total_chunks: int = 0
+    processed_chunks: int = 0
+    total_questions: int = 0
+    processed_questions: int = 0
+    file_types: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    errors: List[str] = field(default_factory=list)
+    memory_usage: List[float] = field(default_factory=list)
     
-    Returns:
-        bool: True if LLM is available, False otherwise
+    def update_memory_usage(self):
+        """Update current memory usage"""
+        process = psutil.Process()
+        self.memory_usage.append(process.memory_info().rss / 1024 / 1024)  # MB
+    
+    def get_elapsed_time(self) -> str:
+        """Get formatted elapsed time"""
+        elapsed = datetime.now() - self.start_time
+        return str(timedelta(seconds=int(elapsed.total_seconds())))
+    
+    def get_progress_percentage(self) -> float:
+        """Calculate overall progress percentage"""
+        if self.total_documents == 0:
+            return 0.0
+        return (self.processed_documents / self.total_documents) * 100
+    
+    def get_memory_usage(self) -> str:
+        """Get current memory usage in MB"""
+        if not self.memory_usage:
+            return "0 MB"
+        return f"{self.memory_usage[-1]:.2f} MB"
+    
+    def log_metrics(self, logger):
+        """Log current metrics"""
+        logger.info("=== Processing Metrics ===")
+        logger.info(f"Elapsed Time: {self.get_elapsed_time()}")
+        logger.info(f"Progress: {self.get_progress_percentage():.1f}%")
+        logger.info(f"Documents: {self.processed_documents}/{self.total_documents}")
+        logger.info(f"Chunks: {self.processed_chunks}/{self.total_chunks}")
+        logger.info(f"Questions: {self.processed_questions}/{self.total_questions}")
+        logger.info(f"Memory Usage: {self.get_memory_usage()}")
+        logger.info("File Types Processed:")
+        for file_type, count in self.file_types.items():
+            logger.info(f"  {file_type}: {count}")
+        if self.errors:
+            logger.info(f"Errors: {len(self.errors)}")
+            for error in self.errors[-5:]:  # Show last 5 errors
+                logger.info(f"  - {error}")
+        logger.info("=======================")
+
+# Create global metrics instance
+metrics = ProcessingMetrics()
+
+def check_llm_availability(max_retries: int = 3, retry_delay: int = 2) -> bool:
+    """
+    Check if the LLM service (Ollama) is available with retry logic.
+    Only checks if the model specified in config is available. Does not override config.
     """
     global LLM_AVAILABLE
-    
-    # Return cached result if we've already checked
     if LLM_AVAILABLE is not None:
         return LLM_AVAILABLE
-    
-    try:
-        # Try to connect to Ollama and check if the model is available
-        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags")
-        
-        if response.status_code != 200:
-            logger.warning(f"Ollama server is running but returned status code {response.status_code}")
-            LLM_AVAILABLE = False
-            return False
-        
-        # Check if our model is available
-        models = response.json().get("models", [])
-        model_names = [model.get("name") for model in models]
-        
-        # If deepseek-llm:7b is available, prioritize it
-        if "deepseek-llm:7b" in model_names:
-            settings.model_name = "deepseek-llm:7b"
-            logger.info(f"Using preferred model deepseek-llm:7b")
-            LLM_AVAILABLE = True
-            return True
-        
-        # If deepseek-r1:32b is available but we should use rule-based approach for large models
-        if "deepseek-r1:32b" in model_names:
-            settings.model_name = "deepseek-r1:32b"
-            logger.info(f"Using preferred model deepseek-r1:32b")
-            # For 32B models, we'll use rule-based approach to avoid timeouts
-            logger.warning("Large 32B model detected - will use rule-based processing to avoid timeouts")
-            LLM_AVAILABLE = False
-            return False
-        
-        if settings.model_name in model_names:
-            # Also check if model name contains markers of very large models
-            if "32b" in settings.model_name.lower() or "32-b" in settings.model_name.lower():
-                logger.warning(f"Large model {settings.model_name} detected - will use rule-based processing to avoid timeouts")
+    model_name = settings.get("llm.model")
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(
+                f"{OLLAMA_BASE_URL}/api/tags",
+                timeout=10
+            )
+            if response.status_code != 200:
+                logger.warning(f"Ollama server returned status code {response.status_code} (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
                 LLM_AVAILABLE = False
                 return False
-            # For 7B models, they're fine to use with LLM
-            elif "7b" in settings.model_name.lower() or "7-b" in settings.model_name.lower():
-                logger.info(f"Using 7B model {settings.model_name} for LLM processing")
+            models = response.json().get("models", [])
+            model_names = [model.get("name") for model in models]
+            if model_name in model_names:
+                logger.info(f"Model '{model_name}' from config is available.")
                 LLM_AVAILABLE = True
                 return True
-                
-            logger.info(f"LLM model {settings.model_name} is available")
-            LLM_AVAILABLE = True
-            return True
-        else:
-            logger.warning(f"Model {settings.model_name} not found in available models: {model_names}")
-            
-            # If we have any model available, we can still use it
-            if models:
-                # Use the first available model that's not a huge model
-                for model in models:
-                    model_name = model['name']
-                    # Prefer 7B models
-                    if "7b" in model_name.lower() or "7-b" in model_name.lower():
-                        settings.model_name = model_name
-                        logger.info(f"Will use available 7B model: {settings.model_name} instead")
-                        LLM_AVAILABLE = True
-                        return True
-                    # Avoid 32B models
-                    elif "32b" not in model_name.lower() and "32-b" not in model_name.lower():
-                        settings.model_name = model_name
-                        logger.info(f"Will use available model: {settings.model_name} instead")
-                        LLM_AVAILABLE = True
-                        return True
-            
+            logger.warning(f"Model '{model_name}' from config not found in available models: {model_names}")
             LLM_AVAILABLE = False
             return False
-            
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Ollama server is not available: {e}")
-        LLM_AVAILABLE = False
-        return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error connecting to Ollama (attempt {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+            LLM_AVAILABLE = False
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error checking LLM availability: {str(e)}")
+            LLM_AVAILABLE = False
+            return False
+    LLM_AVAILABLE = False
+    return False
+
+def get_file_extension(filename: str) -> str:
+    """
+    Get file extension from filename.
+    
+    Args:
+        filename: Path or filename
+        
+    Returns:
+        Lowercase file extension with dot (e.g., '.pdf')
+    """
+    return os.path.splitext(filename)[1].lower()
 
 def load_documents(source_dir: str) -> List[Document]:
     """
     Load documents from a specified source directory with multiple file types.
-    
-    Args:
-        source_dir: Directory containing documents
-        
-    Returns:
-        List of Document objects with metadata
     """
     documents = []
     
-    logger.info(f"Loading documents from {source_dir}")
+    # Convert to absolute path and normalize
+    abs_source_dir = os.path.normpath(os.path.abspath(source_dir))
+    logger.info(f"Loading documents from: {abs_source_dir}")
     
     # Define loaders for different file types
     loaders = {
@@ -167,12 +201,18 @@ def load_documents(source_dir: str) -> List[Document]:
         ".json": JSONLoader,
     }
     
-    for root, _, files in os.walk(source_dir):
+    for root, _, files in os.walk(abs_source_dir):
         for file in files:
-            file_path = os.path.join(root, file)
-            file_ext = os.path.splitext(file)[1].lower()
+            file_path = os.path.normpath(os.path.join(root, file))
+            file_ext = get_file_extension(file)
             
             try:
+                logger.info(f"Processing file: {file_path}")
+                logger.info(f"File type: {file_ext}")
+                
+                # Update file type metrics
+                metrics.file_types[file_ext] += 1
+                
                 # Extract topic from path
                 topic = os.path.splitext(file)[0]
                 metadata = {
@@ -183,11 +223,36 @@ def load_documents(source_dir: str) -> List[Document]:
                 # Use specific loader if available, otherwise use UnstructuredFileLoader
                 if file_ext in loaders:
                     if file_ext == ".json":
-                        # JSON loader requires a jq-like string to specify the content field
-                        loader = loaders[file_ext](file_path, jq=".content", text_content=True)
+                        try:
+                            # First try with content field
+                            loader = loaders[file_ext](
+                                file_path,
+                                text_content=True,
+                                jq_schema=".content"
+                            )
+                            docs = loader.load()
+                        except Exception as e:
+                            logger.warning(f"Failed to load JSON with .content schema, trying alternative: {str(e)}")
+                            try:
+                                # Try with text field
+                                loader = loaders[file_ext](
+                                    file_path,
+                                    text_content=True,
+                                    jq_schema=".text"
+                                )
+                                docs = loader.load()
+                            except Exception as e:
+                                logger.warning(f"Failed to load JSON with .text schema, trying raw content: {str(e)}")
+                                # Try loading raw JSON content
+                                with open(file_path, 'r', encoding='utf-8') as f:
+                                    content = json.load(f)
+                                    if isinstance(content, dict):
+                                        # Convert dict to string representation
+                                        content = json.dumps(content, ensure_ascii=False)
+                                    docs = [Document(page_content=str(content), metadata=metadata)]
                     else:
                         loader = loaders[file_ext](file_path)
-                    docs = loader.load()
+                        docs = loader.load()
                 else:
                     # Try to load as a generic file
                     loader = UnstructuredFileLoader(file_path)
@@ -197,11 +262,15 @@ def load_documents(source_dir: str) -> List[Document]:
                 for doc in docs:
                     doc.metadata.update(metadata)
                 
+                # Update metrics
+                metrics.total_documents += len(docs)
                 documents.extend(docs)
                 logger.info(f"Loaded {len(docs)} documents from {file_path}")
                 
             except Exception as e:
-                logger.error(f"Error loading {file_path}: {e}")
+                error_msg = f"Error loading {file_path}: {str(e)}"
+                logger.error(error_msg)
+                metrics.errors.append(error_msg)
     
     return documents
 
@@ -212,38 +281,28 @@ def split_documents(
     max_chunks: int = None
 ) -> List[Document]:
     """
-    Split documents into smaller chunks using sentence-aware token splitting.
-    
-    Args:
-        documents: List of documents to split
-        chunk_size: Size of chunks in tokens
-        chunk_overlap: Overlap between chunks in tokens
-        max_chunks: Maximum number of chunks to return (for memory management)
-        
-    Returns:
-        List of chunked Document objects
+    Split documents into chunks using sentence transformers token splitter.
     """
-    if not documents:
-        logger.warning("No documents to split")
-        return []
-        
-    # Use the SentenceTransformersTokenTextSplitter for better chunking
-    splitter = SentenceTransformersTokenTextSplitter(
-        model_name="all-MiniLM-L6-v2",
-        chunk_size=chunk_size, 
-        chunk_overlap=chunk_overlap
-    )
-    
-    chunks = splitter.split_documents(documents)
-    logger.info(f"Split {len(documents)} documents into {len(chunks)} chunks")
-    
-    # Limit chunks if max_chunks is specified (for memory management)
-    if max_chunks and len(chunks) > max_chunks:
-        logger.warning(f"Limiting to {max_chunks} chunks to manage memory usage")
-        # Prioritize chunks from different documents for diversity
-        chunks = chunks[:max_chunks]
-    
-    return chunks
+    try:
+        text_splitter = SentenceTransformersTokenTextSplitter(
+            tokens_per_chunk=chunk_size,
+            chunk_overlap=chunk_overlap,
+            model_name=EMBEDDING_MODEL
+        )
+        chunks = []
+        for doc in documents:
+            doc_chunks = text_splitter.split_documents([doc])
+            chunks.extend(doc_chunks)
+            metrics.processed_documents += 1
+            metrics.total_chunks += len(doc_chunks)
+            logger.info(f"Split document into {len(doc_chunks)} chunks")
+        if max_chunks and len(chunks) > max_chunks:
+            chunks = chunks[:max_chunks]
+            logger.info(f"Limited chunks to {max_chunks}")
+        return chunks
+    except Exception as e:
+        logger.error(f"Error splitting documents: {str(e)}")
+        raise
 
 def rule_based_question_generation(content: str, num_questions: int = 3) -> List[str]:
     """
@@ -331,170 +390,91 @@ def rule_based_question_generation(content: str, num_questions: int = 3) -> List
 
 def generate_questions_from_content(content: str, num_questions: int = 3) -> List[str]:
     """
-    Generate relevant questions from document content using Ollama API or fallback to rule-based.
+    Generate questions from content using LLM or rule-based approach.
     
     Args:
-        content: Document content text
+        content: Text content to generate questions from
         num_questions: Number of questions to generate
         
     Returns:
         List of generated questions
     """
-    # First check if LLM is available
-    llm_available = check_llm_availability()
-    
-    if not llm_available:
-        logger.warning("LLM not available. Using rule-based question generation.")
-        return rule_based_question_generation(content, num_questions)
-    
-    import requests
-    import json
-    
-    # Truncate content if too long
-    max_content_length = 1000  # Reduced from 2000 to help prevent timeouts with large models
-    if len(content) > max_content_length:
-        content = content[:max_content_length] + "..."
-    
-    prompt = f"""
-    Given the following content, generate {num_questions} specific, relevant questions that could be asked about this information. 
-    Make sure the questions are clear, focused, and can be answered using the provided content.
-    
-    CONTENT:
-    {content}
-    
-    QUESTIONS (provide exactly {num_questions} questions, numbered 1-{num_questions}):
-    """
-    
     try:
-        # Call Ollama API to generate questions
-        response = requests.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            json={
-                "model": settings.model_name,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.7,
-                    "top_p": 0.9,
-                }
-            },
-            timeout=300  # Increased timeout for large models (was 120)
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"Error calling Ollama API: {response.text}")
-            return rule_based_question_generation(content, num_questions)
-        
-        result = response.json()
-        generated_text = result.get("response", "")
-        
-        # Parse questions from response
-        questions = []
-        for line in generated_text.split('\n'):
-            line = line.strip()
-            # Extract questions that contain a question mark
-            if '?' in line and (line[0].isdigit() or line.lower().startswith("question")):
-                # Remove any numbering or "Question:" prefix
-                question = line.split(".", 1)[-1].split(":", 1)[-1].strip()
-                questions.append(question)
-        
-        if not questions:
-            # If no questions were successfully parsed, look for lines with question marks
-            questions = [line.strip() for line in generated_text.split('\n') 
-                        if '?' in line and len(line.strip()) > 10]
-        
-        # Ensure we have the requested number of questions
-        if not questions or len(questions) < num_questions:
-            # If LLM didn't generate enough questions, add some from rule-based approach
-            rule_questions = rule_based_question_generation(content, num_questions - len(questions))
-            questions.extend(rule_questions)
+        # Check if LLM is available
+        if check_llm_availability():
+            # Use LLM for question generation
+            prompt = f"""Generate {num_questions} relevant questions based on the following content.
+            The questions should be specific, clear, and test understanding of key concepts.
             
-        return questions[:num_questions]
+            Content:
+            {content}
+            
+            Questions:"""
+            
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": settings.get("llm.model"),
+                    "prompt": prompt,
+                    "stream": False
+                }
+            )
+            
+            if response.status_code == 200:
+                questions = response.json()["response"].split("\n")
+                questions = [q.strip() for q in questions if q.strip()]
+                return questions[:num_questions]
+        
+        # Fallback to rule-based approach
+        return rule_based_question_generation(content, num_questions)
         
     except Exception as e:
-        logger.error(f"Error generating questions with LLM: {e}")
-        # Fallback to rule-based generation
+        logger.error(f"Error generating questions: {str(e)}", exc_info=True)
         return rule_based_question_generation(content, num_questions)
 
 def enhance_answer(content: str, question: str) -> str:
     """
-    Enhance document content to create a more structured answer to the question.
+    Enhance answer with additional context and formatting.
     
     Args:
-        content: Original document content
-        question: The question being asked
+        content: Original content
+        question: Question being answered
         
     Returns:
-        Enhanced answer text
+        Enhanced answer
     """
-    # First check if LLM is available
-    llm_available = check_llm_availability()
-    
-    if not llm_available:
-        logger.warning("LLM not available. Returning original content as answer.")
-        # Try to extract the most relevant parts of the content as the answer
-        sentences = content.split('.')
-        relevant_sentences = []
-        
-        # Look for sentences that might contain keywords from the question
-        question_keywords = set(re.findall(r'\b\w{4,}\b', question.lower()))
-        for sentence in sentences:
-            if any(keyword in sentence.lower() for keyword in question_keywords):
-                relevant_sentences.append(sentence)
-        
-        # If we found relevant sentences, join them; otherwise return the original content
-        if relevant_sentences:
-            return '. '.join(relevant_sentences[:5]) + '.'
-        return content
-    
-    import requests
-    
-    # Truncate content if too long
-    max_content_length = 1000  # Reduced from 2000 to help prevent timeouts
-    if len(content) > max_content_length:
-        content = content[:max_content_length] + "..."
-    
-    prompt = f"""
-    Given the following QUESTION and CONTENT from a document, create a well-structured, 
-    comprehensive answer that directly addresses the question using only information from the content.
-    
-    QUESTION: {question}
-    
-    CONTENT:
-    {content}
-    
-    ANSWER:
-    """
-    
     try:
-        # Call Ollama API to generate enhanced answer
-        response = requests.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            json={
-                "model": settings.model_name,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.3,  # Lower temperature for more factual responses
-                    "top_p": 0.9,
+        # Check if LLM is available
+        if check_llm_availability():
+            # Use LLM to enhance answer
+            prompt = f"""Given the following content and question, provide a clear and comprehensive answer.
+            Include relevant details and examples from the content.
+            
+            Content:
+            {content}
+            
+            Question:
+            {question}
+            
+            Answer:"""
+            
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": settings.get("llm.model"),
+                    "prompt": prompt,
+                    "stream": False
                 }
-            },
-            timeout=360  # Increased timeout for large models (was 180)
-        )
+            )
+            
+            if response.status_code == 200:
+                return response.json()["response"].strip()
         
-        if response.status_code != 200:
-            logger.error(f"Error calling Ollama API: {response.text}")
-            return content
-        
-        result = response.json()
-        enhanced_answer = result.get("response", "").strip()
-        
-        if enhanced_answer:
-            return enhanced_answer
+        # Fallback to simple answer
         return content
         
     except Exception as e:
-        logger.error(f"Error enhancing answer: {e}")
+        logger.error(f"Error enhancing answer: {str(e)}", exc_info=True)
         return content
 
 def process_document_chunk(chunk_data):
@@ -520,60 +500,79 @@ def process_document_chunk(chunk_data):
     
     logger.info(f"Processing document chunk {i}")
     
-    # Update global progress counters
-    with PROGRESS_LOCK:
-        CHUNKS_PROCESSED += 1
-        CURRENT_CHUNK = i
-        # Call progress callback with the values directly
-        if PROGRESS_CALLBACK:
-            try:
-                PROGRESS_CALLBACK(i, CHUNKS_PROCESSED)
-            except Exception as e:
-                # If callback errors, just log it but continue processing
-                logger.warning(f"Progress callback error for chunk {i}: {e}")
-    
     try:
-        # Extract content from document
+        # Update global progress counters
+        with PROGRESS_LOCK:
+            CHUNKS_PROCESSED += 1
+            CURRENT_CHUNK = i
+            if PROGRESS_CALLBACK:
+                try:
+                    PROGRESS_CALLBACK(i, CHUNKS_PROCESSED)
+                except Exception as e:
+                    logger.warning(f"Progress callback error for chunk {i}: {e}")
+        
+        # Extract content from document with validation
+        if not hasattr(doc, 'page_content') or not doc.page_content:
+            logger.error(f"Invalid document format for chunk {i}")
+            return []
+            
         content = doc.page_content
         source = doc.metadata.get("source", "unknown")
         topic = doc.metadata.get("topic", "unknown")
         
         # Generate questions based on the content
-        questions = generate_questions_from_content(content, questions_per_chunk)
+        try:
+            questions = generate_questions_from_content(content, questions_per_chunk)
+            if not questions:
+                logger.warning(f"No questions generated for chunk {i}")
+                return []
+        except Exception as e:
+            logger.error(f"Error generating questions for chunk {i}: {e}")
+            return []
         
         # Create conversation for each question
         for q in questions:
             if STOP_PROCESSING.is_set():
                 break
                 
-            # Create the answer
-            if enhance_answers:
-                answer = enhance_answer(content, q)
-            else:
-                answer = content
-            
-            # Create conversation object
-            conv = {
-                "id": f"chunk_{i}_q_{hash(q) % 10000}",
-                "source": source,
-                "topic": topic,
-                "conversations": [
-                    {
-                        "from": "human",
-                        "value": q
-                    },
-                    {
-                        "from": "gpt",
-                        "value": answer
-                    }
-                ]
-            }
-            
-            # Add system prompt if provided
-            if system_prompt:
-                conv["system"] = system_prompt
+            try:
+                # Create the answer
+                if enhance_answers:
+                    answer = enhance_answer(content, q)
+                else:
+                    answer = content
                 
-            conversations.append(conv)
+                # Validate answer
+                if not answer or len(answer.strip()) == 0:
+                    logger.warning(f"Empty answer generated for question in chunk {i}")
+                    continue
+                
+                # Create conversation object
+                conv = {
+                    "id": f"chunk_{i}_q_{hash(q) % 10000}",
+                    "source": source,
+                    "topic": topic,
+                    "conversations": [
+                        {
+                            "from": "human",
+                            "value": q
+                        },
+                        {
+                            "from": "gpt",
+                            "value": answer
+                        }
+                    ]
+                }
+                
+                # Add system prompt if provided
+                if system_prompt:
+                    conv["system"] = system_prompt
+                    
+                conversations.append(conv)
+                
+            except Exception as e:
+                logger.error(f"Error processing question in chunk {i}: {e}")
+                continue
         
         logger.info(f"Generated {len(conversations)} conversations from chunk {i}")
         return conversations
@@ -583,190 +582,240 @@ def process_document_chunk(chunk_data):
         return []
 
 def convert_to_sharegpt_format(
-    documents: List[Document], 
-    system_prompt: Optional[str] = None,
-    questions_per_chunk: int = 2,
-    enhance_answers: bool = True,
-    max_workers: int = 4,
-    batch_size: int = None,
-    progress_callback: Callable = None,
-) -> List[Dict]:
+    question: str,
+    answer: str,
+    system_prompt: Optional[str] = None
+) -> Dict[str, Any]:
     """
-    Convert documents to ShareGPT format by generating questions and answers.
+    Convert a question-answer pair to ShareGPT format.
     
     Args:
-        documents: List of Document objects to process
-        system_prompt: Optional system prompt to set context
-        questions_per_chunk: Number of questions to generate per document
-        enhance_answers: Whether to enhance answers with LLM
-        max_workers: Maximum number of parallel workers
-        batch_size: Maximum number of documents to process at once
-        progress_callback: Optional callback function to report progress
+        question: Question text
+        answer: Answer text
+        system_prompt: Optional system prompt
         
     Returns:
-        List of conversation objects in ShareGPT format
+        Dictionary in ShareGPT format
     """
-    global PROGRESS_CALLBACK, STOP_PROCESSING, CHUNKS_PROCESSED, CURRENT_CHUNK
-    
-    if not documents:
-        logger.warning("No documents to convert")
-        return []
-    
-    # Set progress callback if provided
-    PROGRESS_CALLBACK = progress_callback
-    
-    # Reset progress tracking
-    STOP_PROCESSING.clear()
-    CHUNKS_PROCESSED = 0
-    CURRENT_CHUNK = 0
-    
-    # Set batch size if specified
-    if batch_size:
-        documents = documents[:batch_size]
-    
-    # Create tasks for parallel processing
-    tasks = [
-        (i, doc, system_prompt, questions_per_chunk, enhance_answers)
-        for i, doc in enumerate(documents)
-    ]
-    
-    logger.info(f"Converting {len(documents)} documents to ShareGPT format with {max_workers} workers")
-    
-    # Define a wrapper for error handling
-    def safe_process(chunk_data):
-        try:
-            return process_document_chunk(chunk_data)
-        except Exception as e:
-            logger.error(f"Error in worker thread: {e}")
-            return []
-    
-    # Process documents in parallel
-    results = []
-    
-    # Adjust workers count if fewer documents than workers
-    actual_workers = min(max_workers, len(documents))
-    
     try:
-        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-            # Submit all tasks
-            future_to_task = {executor.submit(safe_process, task): task for task in tasks}
+        # Create conversation
+        conversation = []
+        
+        # Add system message if provided
+        if system_prompt:
+            conversation.append({
+                "from": "system",
+                "value": system_prompt
+            })
+        
+        # Add human question
+        conversation.append({
+            "from": "human",
+            "value": question
+        })
+        
+        # Add gpt answer
+        conversation.append({
+            "from": "gpt",
+            "value": answer
+        })
+        
+        return {
+            "conversations": conversation,
+            "metadata": {
+                "timestamp": datetime.now().isoformat(),
+                "source": "document_processing"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error converting to ShareGPT format: {str(e)}", exc_info=True)
+        raise
+
+def process_chunks_to_sharegpt(
+    chunks: list,
+    system_prompt: str = None,
+    questions_per_chunk: int = 2,
+    enhance_answers: bool = False
+) -> list:
+    """
+    Process all chunks, generate Q&A pairs, and convert to ShareGPT format.
+    """
+    sharegpt_data = []
+    metrics.total_chunks = len(chunks)
+    metrics.total_questions = len(chunks) * questions_per_chunk
+    
+    for i, doc in enumerate(chunks):
+        metrics.processed_chunks = i + 1
+        metrics.update_memory_usage()
+        
+        content = getattr(doc, 'page_content', None)
+        if not content:
+            continue
             
-            # Process results as they complete
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                try:
-                    conversations = future.result()
-                    results.extend(conversations)
-                except Exception as e:
-                    logger.error(f"Task {task[0]} generated an exception: {e}")
-    except KeyboardInterrupt:
-        logger.warning("Processing interrupted by user")
-        STOP_PROCESSING.set()
+        # Generate questions
+        questions = generate_questions_from_content(content, questions_per_chunk)
+        for q in questions:
+            metrics.processed_questions += 1
+            if enhance_answers:
+                answer = enhance_answer(content, q)
+            else:
+                answer = content
+            sharegpt_data.append(
+                convert_to_sharegpt_format(q, answer, system_prompt=system_prompt)
+            )
+            
+        # Log metrics periodically
+        if (i + 1) % 10 == 0:  # Log every 10 chunks
+            metrics.log_metrics(logger)
     
-    # Sort results by source and ID for consistency
-    results.sort(key=lambda x: (x.get("source", ""), x.get("id", "")))
-    
-    logger.info(f"Generated {len(results)} conversations in ShareGPT format")
-    return results
+    return sharegpt_data
 
 def main():
     """Main function to convert documents to ShareGPT format."""
-    parser = argparse.ArgumentParser(
-        description="Convert documents to ShareGPT format for fine-tuning"
-    )
-    parser.add_argument(
-        "--source_dir", "-s",
-        type=str,
-        default=os.path.join(DATA_DIR, "raw"),
-        help="Directory containing documents to convert"
-    )
-    parser.add_argument(
-        "--output_file", "-o",
-        type=str,
-        default=os.path.join(DATA_DIR, "training", "generated_conversations.json"),
-        help="Output file for ShareGPT format data"
-    )
-    parser.add_argument(
-        "--chunk_size", "-c",
-        type=int,
-        default=1024,
-        help="Size of document chunks in tokens"
-    )
-    parser.add_argument(
-        "--chunk_overlap", "-v",
-        type=int,
-        default=128,
-        help="Overlap between chunks in tokens"
-    )
-    parser.add_argument(
-        "--questions_per_chunk", "-q",
-        type=int,
-        default=2,
-        help="Number of questions to generate per chunk"
-    )
-    parser.add_argument(
-        "--system_prompt", "-p",
-        type=str,
-        default=None,
-        help="System prompt to use in conversations"
-    )
-    parser.add_argument(
-        "--enhance_answers", "-e",
-        action="store_true",
-        help="Enhance answers using LLM"
-    )
-    parser.add_argument(
-        "--max_workers", "-w",
-        type=int,
-        default=4,
-        help="Maximum number of parallel workers"
-    )
-    parser.add_argument(
-        "--max_chunks", "-m",
-        type=int,
-        default=None,
-        help="Maximum number of chunks to process (for memory management)"
-    )
-    parser.add_argument(
-        "--batch_size", "-b",
-        type=int,
-        default=MAX_BATCH_SIZE,
-        help=f"Batch size for processing (default: {MAX_BATCH_SIZE})"
-    )
-    
-    args = parser.parse_args()
-    
-    # Check if LLM is available
-    llm_status = "available" if check_llm_availability() else "unavailable"
-    logger.info(f"LLM service status: {llm_status}")
-    
-    # Load documents
-    documents = load_documents(args.source_dir)
-    if not documents:
-        logger.error("No documents found. Exiting.")
+    try:
+        parser = argparse.ArgumentParser(
+            description="Convert documents to ShareGPT format for fine-tuning"
+        )
+        parser.add_argument(
+            "--source_dirs", "-s",
+            type=str,
+            nargs="+",  # Allow multiple source directories
+            default=[os.path.join(DATA_DIR, "raw"), os.path.join(DATA_DIR, "insurance")],
+            help="Directories containing documents to convert (space-separated)"
+        )
+        parser.add_argument(
+            "--output_file", "-o",
+            type=str,
+            default=os.path.join(DATA_DIR, "training", "generated_conversations.json"),
+            help="Output file for ShareGPT format data"
+        )
+        parser.add_argument(
+            "--chunk_size", "-c",
+            type=int,
+            default=256,
+            help="Size of document chunks in tokens"
+        )
+        parser.add_argument(
+            "--chunk_overlap", "-v",
+            type=int,
+            default=128,
+            help="Overlap between chunks in tokens"
+        )
+        parser.add_argument(
+            "--questions_per_chunk", "-q",
+            type=int,
+            default=2,
+            help="Number of questions to generate per chunk"
+        )
+        parser.add_argument(
+            "--system_prompt", "-p",
+            type=str,
+            default=None,
+            help="System prompt to use in conversations"
+        )
+        parser.add_argument(
+            "--enhance_answers", "-e",
+            action="store_true",
+            help="Enhance answers using LLM"
+        )
+        parser.add_argument(
+            "--max_workers", "-w",
+            type=int,
+            default=4,
+            help="Maximum number of parallel workers"
+        )
+        parser.add_argument(
+            "--max_chunks", "-m",
+            type=int,
+            default=None,
+            help="Maximum number of chunks to process (for memory management)"
+        )
+        parser.add_argument(
+            "--batch_size", "-b",
+            type=int,
+            default=MAX_BATCH_SIZE,
+            help=f"Batch size for processing (default: {MAX_BATCH_SIZE})"
+        )
+        
+        # Load chunk_size from rag.yaml
+        try:
+            with open(os.path.join(os.path.dirname(__file__), '../config/rag.yaml'), 'r') as f:
+                rag_config = yaml.safe_load(f)
+                chunk_size_default = rag_config.get('rag', {}).get('chunk_size', 256)
+        except Exception as e:
+            chunk_size_default = 256
+            logger.warning(f"Could not load chunk_size from rag.yaml: {e}")
+        
+        args = parser.parse_args()
+        
+        # Log the model name from config
+        logger.info(f"Using model from config: {settings.get('llm.model')}")
+        # Check if LLM is available
+        llm_status = "available" if check_llm_availability() else "unavailable"
+        logger.info(f"LLM service status: {llm_status}")
+        
+        # Load documents from all source directories
+        all_documents = []
+        for source_dir in args.source_dirs:
+            logger.info(f"Processing documents from {source_dir}")
+            try:
+                documents = load_documents(source_dir)
+                if documents:
+                    all_documents.extend(documents)
+                    metrics.processed_documents += len(documents)
+                    logger.info(f"Loaded {len(documents)} documents from {source_dir}")
+                else:
+                    logger.warning(f"No documents found in {source_dir}")
+            except Exception as e:
+                logger.error(f"Error loading documents from {source_dir}: {str(e)}", exc_info=True)
+                continue
+        
+        if not all_documents:
+            logger.error("No documents found in any source directory. Exiting.")
+            sys.exit(1)
+        
+        # Split documents into chunks
+        try:
+            chunks = split_documents(all_documents, args.chunk_size, args.chunk_overlap, args.max_chunks)
+            logger.info(f"Successfully split documents into {len(chunks)} chunks")
+        except Exception as e:
+            logger.error(f"Error splitting documents: {str(e)}", exc_info=True)
+            sys.exit(1)
+        
+        # Convert to ShareGPT format
+        try:
+            sharegpt_data = process_chunks_to_sharegpt(
+                chunks,
+                system_prompt=args.system_prompt,
+                questions_per_chunk=args.questions_per_chunk,
+                enhance_answers=args.enhance_answers
+            )
+            logger.info(f"Successfully processed {len(sharegpt_data)} conversations")
+        except Exception as e:
+            logger.error(f"Error processing chunks: {str(e)}", exc_info=True)
+            sys.exit(1)
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+        
+        # Write to output file
+        try:
+            with open(args.output_file, "w", encoding="utf-8") as f:
+                json.dump(sharegpt_data, f, indent=2, ensure_ascii=False)
+            logger.info(f"Successfully wrote {len(sharegpt_data)} conversations to {args.output_file}")
+        except Exception as e:
+            logger.error(f"Error writing output file: {str(e)}", exc_info=True)
+            sys.exit(1)
+        
+        # Log final metrics
+        metrics.log_metrics(logger)
+        
+    except Exception as e:
+        logger.error(f"Unexpected error in main: {str(e)}", exc_info=True)
+        metrics.errors.append(f"Main processing error: {str(e)}")
+        metrics.log_metrics(logger)
         sys.exit(1)
-    
-    # Split documents into chunks
-    chunks = split_documents(documents, args.chunk_size, args.chunk_overlap, args.max_chunks)
-    
-    # Convert to ShareGPT format
-    sharegpt_data = convert_to_sharegpt_format(
-        chunks,
-        system_prompt=args.system_prompt,
-        questions_per_chunk=args.questions_per_chunk,
-        enhance_answers=args.enhance_answers,
-        max_workers=args.max_workers,
-        batch_size=args.batch_size
-    )
-    
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
-    
-    # Write to output file
-    with open(args.output_file, "w", encoding="utf-8") as f:
-        json.dump(sharegpt_data, f, indent=2, ensure_ascii=False)
-    
-    logger.info(f"Written {len(sharegpt_data)} conversations to {args.output_file}")
 
 if __name__ == "__main__":
     main() 

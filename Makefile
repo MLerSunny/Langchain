@@ -3,18 +3,18 @@
 .PHONY: setup ingest serve finetune test clean help docker-build docker-up docker-down lint install-hooks streamlit rag
 
 # Default Python command
-PYTHON = python
+PYTHON ?= python
 
-# Port configuration
-FASTAPI_PORT = 8000
-VLLM_PORT = 8001
-STREAMLIT_PORT = 8501
+# Port configuration (can be overridden by environment)
+FASTAPI_PORT ?= 8000
+VLLM_PORT ?= 8001
+STREAMLIT_PORT ?= 8501
 
-# Configuration variables
-SOURCE_DIR = data/raw
-TRAIN_DATA = data/training
-EVAL_DATA = data/eval
-MODEL_NAME = deepseek-llm:7b
+# Configuration variables (can be overridden by environment)
+SOURCE_DIR ?= data/raw
+TRAIN_DATA ?= data/training
+EVAL_DATA ?= data/eval
+MODEL_NAME ?= deepseek-llm:7b
 
 help:
 	@echo "Available commands:"

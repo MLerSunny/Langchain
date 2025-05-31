@@ -1,0 +1,61 @@
+model:
+  name: "deepseek-coder"
+  base_model: "deepseek-ai/deepseek-coder-6.7b-base"
+  inference_engine: "ollama"
+  fine_tuning_engine: "huggingface"
+
+fine_tuning:
+  quantization:
+    enabled: true
+    bits: 4
+    dtype: "float16"
+  
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+  training:
+    epochs: 3
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    learning_rate: 2e-4
+    fp16: true
+    logging_steps: 10
+    save_strategy: "epoch"
+    evaluation_strategy: "epoch"
+    load_best_model_at_end: true
+
+  dataset:
+    max_length: 512
+    padding: "max_length"
+    truncation: true
+
+inference:
+  ollama:
+    host: "localhost"
+    port: 11434
+    model_name: "deepseek-llm:7b"
+    default_max_tokens: 512
+    default_temperature: 0.7
+    stream: false
+
+  gradio:
+    share: true
+    input_lines: 5
+    output_lines: 10
+    max_tokens_range: [1, 2048]
+    temperature_range: [0.1, 1.0]
+
+paths:
+  checkpoints: "./checkpoints"
+  final_model: "./final_model"
+  dataset: "./data/training" 

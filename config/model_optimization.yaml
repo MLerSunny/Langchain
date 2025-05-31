@@ -1,0 +1,161 @@
+# Model Optimization Configuration
+# Training Settings
+training:
+  batch_size: 8  # Standardized with settings.py
+  gradient_accumulation_steps: 4  # Standardized with settings.py
+  learning_rate: 2e-5
+  max_epochs: 3
+  warmup_steps: 100
+  weight_decay: 0.01
+  scheduler: "linear"  # Options: linear, cosine, constant
+  early_stopping:
+    patience: 3
+    min_delta: 0.001
+  mixed_precision: true
+  gradient_clipping: 1.0
+  fp16: true
+  optim: "adamw_torch"
+  report_to: "tensorboard"
+  remove_unused_columns: true
+  gradient_checkpointing: true
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+
+# Model Settings
+model:
+  base_model: "deepseek-llm-7b"  # HuggingFace model name
+  ollama_model: "deepseek-llm:7b"  # Ollama model name
+  max_length: 2048  # Standardized with settings.py
+  temperature: 0.7
+  top_p: 1.0
+  repetition_penalty: 1.1
+  length_penalty: 1.0
+  no_repeat_ngram_size: 3
+  torch_dtype: "float16"
+  device_map: "auto"
+  use_cache: true
+  max_memory: "80GB"
+  offload_folder: "data/models/offload"
+
+# Quantization Settings
+quantization:
+  enabled: true
+  use_4bit: false
+  use_8bit: true
+  compute_dtype: "float16"
+  use_double_quant: true
+  quant_type: "nf4"
+  group_size: 128
+  scheme: "gptq"  # Options: gptq, awq
+  calibration:
+    dataset: "c4"
+    num_samples: 128
+    max_length: 2048
+
+# LoRA Settings
+lora:
+  enabled: true
+  rank: 8
+  alpha: 16
+  dropout: 0.1
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# PEFT Settings
+peft:
+  enabled: true
+  method: "lora"  # Options: lora, prefix_tuning, p_tuning
+  inference_mode: true
+
+# Evaluation Settings
+evaluation:
+  metrics:
+    - "perplexity"
+    - "accuracy"
+    - "f1"
+    - "rouge"
+  eval_batch_size: 8
+  eval_steps: 100
+  save_best_model: true
+  save_strategy: "steps"
+  save_steps: 100
+
+# Logging and Monitoring
+logging:
+  level: "INFO"
+  log_steps: 10
+  log_metrics: true
+  log_gradients: false
+  log_memory: true
+  wandb:
+    enabled: true
+    project: "insurance-rag"
+    tags:
+      - "optimization"
+      - "lora"
+      - "quantization"
+  log_to_file: true
+  log_file: "data/logs/training.log"
+  tensorboard_dir: "data/logs/tensorboard"
+
+# Resource Management
+resources:
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+  max_gpu_memory: "24GB"
+  cpu_offload: false
+  gradient_checkpointing: true
+
+# Checkpointing
+checkpointing:
+  enabled: true
+  save_dir: "data/checkpoints"
+  save_total_limit: 3
+  save_best_only: true
+  load_best_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+
+# Error Handling
+error_handling:
+  retry_attempts: 3
+  retry_delay: 1
+  fallback_strategy: "use_base_model"
+  timeout: 300  # seconds
+
+# Feature Flags
+features:
+  gradient_checkpointing: true
+  flash_attention: true
+  deepspeed: false
+  accelerate: true
+  tensor_parallel: false
+  pipeline_parallel: false
+
+# Tokenizer Settings
+tokenizer:
+  pad_token: "[PAD]"
+  model_max_length: 2048
+  padding_side: "right"
+  truncation_side: "right"
+
+# Memory Settings
+memory:
+  max_memory: "8GiB"
+  offload_folder: "data/offload"
+  use_cache: false
+  gradient_checkpointing: true
+  pin_memory: false
+  dataloader_num_workers: 4
+
+# Model Loading Settings
+model_loading:
+  torch_dtype: "float16"
+  device_map: "auto"
+  use_cache: false
+  max_memory: "8GiB"
+  offload_folder: "data/offload" 

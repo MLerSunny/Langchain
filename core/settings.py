@@ -1,137 +1,70 @@
-# core/settings.py
+"""
+Settings management for the RAG system.
+"""
+
 import os
-import yaml
-import logging
 from pathlib import Path
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from .config import Config
 
-logger = logging.getLogger(__name__)
+# Get the project root directory
+PROJECT_ROOT = Path(__file__).parent.parent
 
-class Settings(BaseSettings):
-    # API Server settings
-    fastapi_port: int = 8000
-    vllm_port: int = 8001
-    host: str = "0.0.0.0"
-    
-    # JWT Settings
-    jwt_secret: str = "ypzkQRSJB3QxTBF95c8KwDjgcPrEmn7v"  # Default value that can be overridden by env
-    jwt_algorithm: str = "HS256"
-    
-    # Model settings
-    model_name: str = "deepseek-llm:7b"
-    default_model: str = "deepseek-llm:7b"
-    ollama_base_url: str = "http://localhost:11434"
-    context_window: int = 8192
-    max_tokens: int = 2048
-    temperature: float = 0.1
-    
-    # Vector database settings
-    vector_db: str = "chroma"          # "chroma" | "qdrant"
-    data_path: str = "data/raw"
-    chroma_path: str = ".chroma"
-    chroma_persist_directory: str = "data/chroma"
-    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
-    embedding_dimension: int = 768
-    
-    # Qdrant settings
-    qdrant_host: str = "localhost"
-    qdrant_port: int = 6333
-    qdrant_url: str = "http://vectordb:6333"
-    qdrant_collection_name: str = "insurance_docs"
-    
-    # RAG settings
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
-    top_k: int = 8
-    
-    # Data paths
-    base_dir: str = "."
-    data_dir: str = "data"
-    rag_config_path: str = "core/rag.yaml"
-    deepspeed_config_path: str = "core/deepspeed_zero3.json"
-    
-    # Fine-tuning settings
-    training_dataset_path: str = "data/training"
-    eval_dataset_path: str = "data/eval"
-    output_dir: str = "data/models"
-    learning_rate: float = 2e-5
-    batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    num_epochs: int = 3
-    max_steps: int = -1
-    logging_steps: int = 10
-    save_steps: int = 100
-    warmup_steps: int = 50
-    
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+# Default configuration paths
+DEFAULT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "config", "rag.yaml")
+DEFAULT_DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+DEFAULT_VECTOR_STORE_DIR = os.path.join(DEFAULT_DATA_DIR, "vector_store")
 
-# Create a global settings instance
-settings = Settings()
+# Create settings instance
+settings = Config(DEFAULT_CONFIG_PATH)
 
-# Generate absolute paths based on base_dir
-def get_abs_path(rel_path: str) -> str:
-    """Convert a relative path to absolute based on base_dir setting."""
-    base = Path(settings.base_dir)
-    return str(base / rel_path)
+# Export commonly used paths
+DATA_DIR = settings.get("paths.data_dir", DEFAULT_DATA_DIR)
+CHROMA_PERSIST_DIRECTORY = settings.get("vector_store.persist_directory", DEFAULT_VECTOR_STORE_DIR)
+TRAINING_DATA_DIR = settings.get("paths.training_data_dir", os.path.join(DEFAULT_DATA_DIR, "training", "data"))
+MODELS_DIR = settings.get("paths.models_dir", os.path.join(DEFAULT_DATA_DIR, "models"))
+LOGS_DIR = settings.get("paths.logs_dir", os.path.join(DEFAULT_DATA_DIR, "logs"))
+CACHE_DIR = settings.get("paths.cache_dir", os.path.join(DEFAULT_DATA_DIR, "cache"))
+METRICS_DIR = settings.get("paths.metrics_dir", os.path.join(DEFAULT_DATA_DIR, "metrics"))
+JOBS_DIR = settings.get("paths.jobs_dir", os.path.join(DEFAULT_DATA_DIR, "jobs"))
 
-# Update path settings to absolute paths if they're relative
-if not os.path.isabs(settings.chroma_persist_directory):
-    settings.chroma_persist_directory = get_abs_path(settings.chroma_persist_directory)
+# Export server settings
+HOST = settings.get("server.host", "0.0.0.0")
+FASTAPI_PORT = settings.get("server.fastapi_port", 8000)
+STREAMLIT_PORT = settings.get("server.streamlit_port", 8501)
 
-if not os.path.isabs(settings.data_dir):
-    settings.data_dir = get_abs_path(settings.data_dir)
+# Export model settings
+MODEL_NAME = settings.get("llm.model")
+EMBEDDING_MODEL = settings.get("embeddings.model")
 
-if not os.path.isabs(settings.rag_config_path):
-    settings.rag_config_path = get_abs_path(settings.rag_config_path)
+# Export RAG settings
+CHUNK_SIZE = settings.get("chunking.chunk_size", 1000)
+CHUNK_OVERLAP = settings.get("chunking.chunk_overlap", 200)
+MAX_CHUNKS = settings.get("chunking.max_chunks", 10)
 
-if not os.path.isabs(settings.training_dataset_path):
-    settings.training_dataset_path = get_abs_path(settings.training_dataset_path)
+# Export security settings
+API_KEY = settings.get("security.api_key")
+ALLOWED_ORIGINS = settings.get("security.allowed_origins", ["http://localhost:8501"])
+RATE_LIMIT = settings.get("security.rate_limit", 100)
 
-if not os.path.isabs(settings.eval_dataset_path):
-    settings.eval_dataset_path = get_abs_path(settings.eval_dataset_path)
+# Export optimization settings
+USE_GPU = settings.get("optimization.use_gpu", False)
+BATCH_SIZE = settings.get("optimization.batch_size", 64)
+MAX_WORKERS = settings.get("optimization.max_workers", 8)
+USE_FP16 = settings.get("optimization.use_fp16", True)
+USE_FLASH_ATTENTION = settings.get("optimization.use_flash_attention", True)
 
-if not os.path.isabs(settings.output_dir):
-    settings.output_dir = get_abs_path(settings.output_dir)
+# Export monitoring settings
+MONITORING_ENABLED = settings.get("monitoring.enabled", True)
+LOG_LEVEL = settings.get("monitoring.log_level", "INFO")
+METRICS_ENABLED = settings.get("monitoring.metrics", [])
 
-if not os.path.isabs(settings.chroma_path):
-    settings.chroma_path = get_abs_path(settings.chroma_path)
+# Export error handling settings
+RETRY_ATTEMPTS = settings.get("error_handling.retry_attempts", 3)
+RETRY_DELAY = settings.get("error_handling.retry_delay", 1000)
+FALLBACK_RESPONSES = settings.get("error_handling.fallback_responses", {})
 
-if not os.path.isabs(settings.data_path):
-    settings.data_path = get_abs_path(settings.data_path)
+# Export feature flags
+FEATURES = settings.get("features", {})
 
-if not os.path.isabs(settings.deepspeed_config_path):
-    settings.deepspeed_config_path = get_abs_path(settings.deepspeed_config_path)
-
-# Load RAG configuration from YAML if it exists
-RAG_CONFIG = {}
-try:
-    if os.path.exists(settings.rag_config_path):
-        with open(settings.rag_config_path, "r") as f:
-            RAG_CONFIG = yaml.safe_load(f)
-except Exception as e:
-    logger.warning(f"Could not load RAG config from {settings.rag_config_path}: {e}")
-
-# Override settings from RAG_CONFIG if available
-if "vector_db" in RAG_CONFIG:
-    settings.chroma_persist_directory = RAG_CONFIG["vector_db"].get(
-        "persist_directory", settings.chroma_persist_directory
-    )
-
-if "document_processing" in RAG_CONFIG:
-    settings.embedding_model = RAG_CONFIG["document_processing"].get(
-        "embedding_model", settings.embedding_model
-    )
-    settings.chunk_size = RAG_CONFIG["document_processing"].get(
-        "chunk_size", settings.chunk_size
-    )
-    settings.chunk_overlap = RAG_CONFIG["document_processing"].get(
-        "chunk_overlap", settings.chunk_overlap
-    )
-
-# Export constants for backward compatibility
-BASE_DIR = settings.base_dir
-DATA_DIR = settings.data_dir
-FASTAPI_PORT = settings.fastapi_port
-HOST = settings.host
-CHROMA_PERSIST_DIRECTORY = settings.chroma_persist_directory
-OLLAMA_BASE_URL = settings.ollama_base_url 
+# Export Ollama settings
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") 

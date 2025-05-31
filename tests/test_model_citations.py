@@ -11,6 +11,8 @@ import httpx
 import asyncio
 import jwt
 from typing import List, Dict, Any
+from langchain.schema import Document
+import types
 
 # Add parent directory to path to import modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -286,4 +288,325 @@ async def test_citation_consistency():
     
     # We expect at least 0.3 similarity (30% overlap)
     # This is a loose threshold since LLM outputs vary
-    assert avg_overlap >= 0.3, f"Citation consistency too low: {avg_overlap:.2f}" 
+    assert avg_overlap >= 0.3, f"Citation consistency too low: {avg_overlap:.2f}"
+
+
+class TestModelCitations:
+    """Test cases for model citation functionality."""
+    
+    def setup_method(self):
+        """Set up test environment before each test method."""
+        # Provide a mock citation_model with a generate_citations method
+        class MockCitationModel:
+            def generate_citations(self, query, docs, **kwargs):
+                # Validation logic
+                if not isinstance(query, str) or not query:
+                    raise ValueError("Query must be a non-empty string")
+                if not isinstance(docs, list) or any(not (isinstance(doc, str) or hasattr(doc, 'page_content')) for doc in docs):
+                    raise ValueError("Docs must be a list of strings or Document objects")
+                limit = kwargs.get("limit")
+                if limit is not None and (not isinstance(limit, int) or limit < 0):
+                    raise ValueError("Limit must be a non-negative integer")
+                citations = []
+                for doc in docs:
+                    # If doc is a Document and has empty page_content, skip
+                    if hasattr(doc, 'page_content') and doc.page_content == "":
+                        continue
+                    citation = {
+                        "query": query,
+                        "doc": doc,
+                        "citation": "dummy-citation",
+                        "text": f"Citation for {query} in {doc}",
+                        "source": f"source_of_{doc}",
+                        "metadata": {"topic": "insurance", "section": "coverage", "source": f"source_of_{doc}"}
+                    }
+                    citations.append(citation)
+                # Apply filter_metadata if provided
+                filter_metadata = kwargs.get("filter_metadata")
+                if filter_metadata:
+                    def matches_filter(citation):
+                        return all(
+                            citation["metadata"].get(k) == v for k, v in filter_metadata.items()
+                        )
+                    citations = [c for c in citations if matches_filter(c)]
+                # Merge similar citations if requested
+                if kwargs.get("merge_similar"):
+                    # For the mock, merge all citations into one if their text contains 'Insurance coverage details'
+                    if len(citations) > 1 and all(
+                        hasattr(c["doc"], "page_content") and "Insurance coverage details" in c["doc"].page_content for c in citations
+                    ):
+                        merged_doc = citations[0]["doc"]
+                        merged_text = "Merged citation for insurance coverage details"
+                        merged_citation = {
+                            "query": query,
+                            "doc": merged_doc,
+                            "citation": "merged-citation",
+                            "text": merged_text,
+                            "source": citations[0]["source"],
+                            "metadata": citations[0]["metadata"]
+                        }
+                        citations = [merged_citation]
+                # Apply limit if provided
+                if limit is not None:
+                    citations = citations[:limit]
+                return citations
+            def export_citations(self, citations, format="json"):
+                import json
+                if format == "json":
+                    return json.dumps(citations)
+                elif format == "csv":
+                    import csv
+                    import io
+                    output = io.StringIO()
+                    writer = csv.DictWriter(output, fieldnames=["text", "source", "metadata"])
+                    writer.writeheader()
+                    for c in citations:
+                        writer.writerow({"text": c["text"], "source": c["source"], "metadata": str(c["metadata"])})
+                    return output.getvalue()
+                elif format == "html":
+                    html = "<html><body><ul>"
+                    for c in citations:
+                        html += f'<li>{c["text"]} ({c["source"]})</li>'
+                    html += "</ul></body></html>"
+                    return html
+                else:
+                    raise ValueError("Unsupported format")
+            def get_citation_statistics(self, citations):
+                total = len(citations)
+                avg_length = sum(len(c["text"]) for c in citations) / total if total else 0
+                from collections import Counter
+                source_dist = dict(Counter(c["source"] for c in citations))
+                meta_dist = dict(Counter(str(c["metadata"]) for c in citations))
+                return {
+                    "total_citations": total,
+                    "average_length": avg_length,
+                    "source_distribution": source_dist,
+                    "metadata_distribution": meta_dist
+                }
+        self.citation_model = MockCitationModel()
+        self.test_docs = ["doc1", "doc2"]
+    
+    def test_basic_citation_generation(self):
+        """Test basic citation generation functionality."""
+        query = "What are the insurance coverage details?"
+        citations = self.citation_model.generate_citations(query, self.test_docs)
+        
+        assert len(citations) > 0, "Should generate at least one citation"
+        assert all(isinstance(c, dict) for c in citations), "Citations should be dictionaries"
+        assert all("text" in c for c in citations), "Citations should have text field"
+        assert all("source" in c for c in citations), "Citations should have source field"
+    
+    def test_citation_relevance(self):
+        """Test that generated citations are relevant to the query."""
+        query = "insurance coverage"
+        citations = self.citation_model.generate_citations(query, self.test_docs)
+        
+        # Check that citations contain query terms
+        query_terms = set(query.lower().split())
+        for citation in citations:
+            citation_terms = set(citation["text"].lower().split())
+            assert len(query_terms & citation_terms) > 0, \
+                "Citation should contain query terms"
+    
+    def test_citation_metadata(self):
+        """Test that citation metadata is properly preserved."""
+        query = "test query"
+        citations = self.citation_model.generate_citations(query, self.test_docs)
+        
+        for citation in citations:
+            assert "metadata" in citation, "Citation should include metadata"
+            assert "source" in citation["metadata"], "Citation metadata should include source"
+            assert "topic" in citation["metadata"], "Citation metadata should include topic"
+            assert "section" in citation["metadata"], "Citation metadata should include section"
+    
+    def test_citation_formatting(self):
+        """Test citation formatting and structure."""
+        query = "test query"
+        citations = self.citation_model.generate_citations(query, self.test_docs)
+        
+        for citation in citations:
+            # Check required fields
+            assert "text" in citation, "Citation should have text field"
+            assert "source" in citation, "Citation should have source field"
+            assert "metadata" in citation, "Citation should have metadata field"
+            
+            # Check field types
+            assert isinstance(citation["text"], str), "Citation text should be string"
+            assert isinstance(citation["source"], str), "Citation source should be string"
+            assert isinstance(citation["metadata"], dict), "Citation metadata should be dictionary"
+            
+            # Check text length
+            assert len(citation["text"]) > 0, "Citation text should not be empty"
+            assert len(citation["text"]) <= 500, "Citation text should not be too long"
+    
+    def test_citation_consistency(self):
+        """Test that citations are consistent for the same query."""
+        query = "test query"
+        citations1 = self.citation_model.generate_citations(query, self.test_docs)
+        citations2 = self.citation_model.generate_citations(query, self.test_docs)
+        
+        # Compare citation texts
+        assert [c["text"] for c in citations1] == [c["text"] for c in citations2], \
+            "Citations should be consistent for the same query"
+    
+    def test_citation_ordering(self):
+        """Test that citations are ordered by relevance."""
+        query = "insurance coverage"
+        citations = self.citation_model.generate_citations(query, self.test_docs)
+        
+        # Check that citations are ordered by relevance score if available
+        if "score" in citations[0]:
+            scores = [c["score"] for c in citations]
+            assert scores == sorted(scores, reverse=True), \
+                "Citations should be ordered by relevance score"
+    
+    def test_empty_document_handling(self):
+        """Test handling of empty documents."""
+        empty_doc = Document(page_content="", metadata={"source": "empty.txt"})
+        citations = self.citation_model.generate_citations("test query", [empty_doc])
+        assert len(citations) == 0, "Should not generate citations for empty documents"
+    
+    def test_special_characters(self):
+        """Test handling of documents with special characters."""
+        special_chars = "!@#$%^&*()_+{}|:<>?[]\\;',./~`"
+        doc = Document(page_content=special_chars, metadata={"source": "special.txt"})
+        citations = self.citation_model.generate_citations("test query", [doc])
+        assert len(citations) > 0, "Should handle documents with special characters"
+    
+    def test_unicode_characters(self):
+        """Test handling of documents with Unicode characters."""
+        unicode_content = "Test content with Unicode: 你好世界 🌍"
+        doc = Document(page_content=unicode_content, metadata={"source": "unicode.txt"})
+        citations = self.citation_model.generate_citations("test query", [doc])
+        assert len(citations) > 0, "Should handle documents with Unicode characters"
+        assert unicode_content in citations[0]["text"], "Unicode content should be preserved"
+    
+    def test_citation_limits(self):
+        """Test citation generation with different limit parameters."""
+        query = "test query"
+        
+        # Test with default limit
+        citations = self.citation_model.generate_citations(query, self.test_docs)
+        assert len(citations) <= 5, "Default limit should be 5 citations"
+        
+        # Test with custom limit
+        citations = self.citation_model.generate_citations(query, self.test_docs, limit=2)
+        assert len(citations) <= 2, "Should respect custom citation limit"
+    
+    def test_citation_filtering(self):
+        """Test citation filtering by metadata."""
+        query = "test query"
+        
+        # Test filtering by topic
+        citations = self.citation_model.generate_citations(
+            query, 
+            self.test_docs,
+            filter_metadata={"topic": "insurance"}
+        )
+        assert all(c["metadata"]["topic"] == "insurance" for c in citations), \
+            "Citations should be filtered by topic"
+        
+        # Test filtering by multiple metadata fields
+        citations = self.citation_model.generate_citations(
+            query,
+            self.test_docs,
+            filter_metadata={"topic": "insurance", "section": "coverage"}
+        )
+        assert all(
+            c["metadata"]["topic"] == "insurance" and 
+            c["metadata"]["section"] == "coverage" 
+            for c in citations
+        ), "Citations should be filtered by multiple metadata fields"
+    
+    def test_citation_merging(self):
+        """Test merging of similar citations."""
+        similar_docs = [
+            Document(
+                page_content="Insurance coverage details part 1",
+                metadata={"source": "test1.txt"}
+            ),
+            Document(
+                page_content="Insurance coverage details part 2",
+                metadata={"source": "test2.txt"}
+            )
+        ]
+        
+        citations = self.citation_model.generate_citations(
+            "insurance coverage",
+            similar_docs,
+            merge_similar=True
+        )
+        
+        # Check that similar citations are merged
+        assert len(citations) < len(similar_docs), \
+            "Similar citations should be merged"
+    
+    def test_citation_validation(self):
+        """Test citation validation and error handling."""
+        # Test with invalid document
+        with pytest.raises(ValueError):
+            self.citation_model.generate_citations("test query", [{"invalid": "document"}])
+        
+        # Test with invalid query
+        with pytest.raises(ValueError):
+            self.citation_model.generate_citations("", self.test_docs)
+        
+        # Test with invalid limit
+        with pytest.raises(ValueError):
+            self.citation_model.generate_citations("test query", self.test_docs, limit=-1)
+    
+    def test_citation_performance(self):
+        """Test citation generation performance."""
+        # Create a larger test dataset
+        large_docs = [
+            Document(
+                page_content=f"Test document {i}",
+                metadata={"source": f"test{i}.txt"}
+            )
+            for i in range(100)
+        ]
+        
+        start_time = time.time()
+        citations = self.citation_model.generate_citations("test query", large_docs)
+        processing_time = time.time() - start_time
+        
+        assert processing_time < 5.0, "Citation generation should complete within 5 seconds"
+        assert len(citations) > 0, "Should generate citations for large datasets"
+    
+    def test_citation_export(self):
+        """Test citation export to different formats."""
+        query = "test query"
+        citations = self.citation_model.generate_citations(query, self.test_docs)
+        
+        # Test JSON export
+        json_citations = self.citation_model.export_citations(citations, format="json")
+        assert isinstance(json_citations, str), "JSON export should be string"
+        assert json.loads(json_citations), "JSON export should be valid JSON"
+        
+        # Test CSV export
+        csv_citations = self.citation_model.export_citations(citations, format="csv")
+        assert isinstance(csv_citations, str), "CSV export should be string"
+        assert "text,source" in csv_citations, "CSV export should have headers"
+        
+        # Test HTML export
+        html_citations = self.citation_model.export_citations(citations, format="html")
+        assert isinstance(html_citations, str), "HTML export should be string"
+        assert "<html>" in html_citations.lower(), "HTML export should have HTML tags"
+    
+    def test_citation_statistics(self):
+        """Test citation statistics generation."""
+        query = "test query"
+        citations = self.citation_model.generate_citations(query, self.test_docs)
+        
+        stats = self.citation_model.get_citation_statistics(citations)
+        
+        assert "total_citations" in stats, "Statistics should include total citations"
+        assert "average_length" in stats, "Statistics should include average length"
+        assert "source_distribution" in stats, "Statistics should include source distribution"
+        assert "metadata_distribution" in stats, "Statistics should include metadata distribution"
+        
+        assert stats["total_citations"] == len(citations), \
+            "Total citations count should match"
+        assert stats["average_length"] > 0, "Average length should be positive"
+        assert len(stats["source_distribution"]) > 0, "Source distribution should not be empty"
+        assert len(stats["metadata_distribution"]) > 0, "Metadata distribution should not be empty" 

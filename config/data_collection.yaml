@@ -1,0 +1,220 @@
+# Data Collection Configuration
+
+# Reddit API Settings
+#reddit:
+#  # Get these credentials from https://www.reddit.com/prefs/apps
+#  # 1. Go to the URL
+#  # 2. Click "create another app..." at the bottom
+#  # 3. Fill in:
+#  #    - Name: Insurance Data Collector
+#  #    - Select "script"
+#  #    - Description: Data collection for insurance research
+#  #    - About URL: (can be left blank)
+#  #    - Redirect URI: http://localhost:8080
+#  # 4. After creating, you'll get:
+#  #    - client_id (under the app name)
+#  #    - client_secret (labeled "secret")
+#  client_id: "bQFWjHNPEXOmepVCNvnWwQ"
+#  client_secret: "SNVt0eXrWBbllX9GpjVZxngh2CrKdw"
+#  user_agent: "YOUR_REDDIT_USER_AGENT"
+#  rate_limit: 60  # requests per minute
+#  max_posts_per_subreddit: 1000
+#  subreddits:
+#    - name: insurance
+#      categories: [auto, home, life, health, business]
+#    - name: personalfinance
+#      categories: [auto, home, life, health]
+#    - name: legaladvice
+#      categories: [auto, home, business]
+#    - name: healthinsurance
+#      categories: [health]
+#    - name: carinsurance
+#      categories: [auto]
+#    - name: homeowners
+#      categories: [home]
+#    - name: lifeinsurance
+#      categories: [life]
+#    - name: businessinsurance
+#      categories: [business]
+
+# Twitter API Settings
+#twitter:
+#  api_key: "YOUR_TWITTER_API_KEY"
+#  api_secret: "YOUR_TWITTER_API_SECRET"
+#  access_token: "YOUR_TWITTER_ACCESS_TOKEN"
+#  access_token_secret: "YOUR_TWITTER_ACCESS_TOKEN_SECRET"
+#  rate_limit: 180  # requests per 15 minutes
+#  max_tweets: 1000
+#  search_terms:
+#    - "insurance"
+#    - "auto insurance"
+#    - "home insurance"
+#    - "life insurance"
+#    - "health insurance"
+#    - "business insurance"
+#    - "#insurance"
+#    - "#autoinsurance"
+#    - "#homeinsurance"
+#    - "#lifeinsurance"
+#    - "#healthinsurance"
+#    - "#businessinsurance"
+
+# News API Settings
+#news_api:
+#  api_key: "YOUR_NEWSAPI_KEY"
+#  rate_limit: 100  # requests per day
+#  max_articles: 100
+#  sources:
+#    - "reuters"
+#    - "bloomberg"
+#    - "wsj"
+#    - "ft"
+#    - "cnbc"
+#  categories:
+#    - "business"
+#    - "finance"
+#    - "technology"
+#    - "health"
+
+# Insurance Quote APIs
+quote_apis:
+  - name: "InsuranceQuotesAPI"
+    base_url: "https://api.insurancequotes.com/v1"
+    rate_limit: 100  # requests per hour
+    categories: [auto, home, life, health]
+    endpoints:
+      - "/quotes"
+      - "/policies"
+      - "/claims"
+  
+  - name: "PolicyGeniusAPI"
+    base_url: "https://api.policygenius.com/v1"
+    rate_limit: 50  # requests per hour
+    categories: [auto, home, life, health]
+    endpoints:
+      - "/quotes"
+      - "/policies"
+      - "/claims"
+  
+  - name: "CoverHoundAPI"
+    base_url: "https://api.coverhound.com/v1"
+    rate_limit: 75  # requests per hour
+    categories: [auto, home]
+    endpoints:
+      - "/quotes"
+      - "/policies"
+
+# Policy Document Sources
+policy_documents:
+  sources:
+    - name: "State Insurance Departments"
+      url: "https://www.naic.org/state_web_map.htm"
+      categories: [auto, home, life, health, business]
+      rate_limit: 10  # requests per minute
+    
+    - name: "Insurance Information Institute"
+      url: "https://www.iii.org"
+      categories: [auto, home, life, health, business]
+      rate_limit: 5  # requests per minute
+    
+    - name: "National Association of Insurance Commissioners"
+      url: "https://www.naic.org"
+      categories: [auto, home, life, health, business]
+      rate_limit: 5  # requests per minute
+    
+    - name: "Insurance Regulatory Information System"
+      url: "https://www.irisonline.org"
+      categories: [auto, home, life, health, business]
+      rate_limit: 2  # requests per minute
+
+# Data Processing Settings
+processing:
+  min_conversation_length: 2
+  max_conversation_length: 10
+  min_text_length: 50
+  max_text_length: 2000
+  required_fields:
+    - source
+    - conversations
+    - timestamp
+    - metadata
+  validation_rules:
+    - type: "length_check"
+      field: "conversations"
+      min: 2
+      max: 10
+    - type: "field_check"
+      fields: ["source", "conversations", "timestamp", "metadata"]
+    - type: "content_check"
+      field: "conversations"
+      min_words: 10
+    - type: "sentiment_check"
+      field: "metadata.sentiment"
+      required: true
+    - type: "entity_check"
+      field: "metadata.entities"
+      min_entities: 1
+  text_processing:
+    remove_urls: true
+    remove_special_chars: true
+    remove_stopwords: true
+    lemmatize: true
+    min_word_length: 3
+    max_word_length: 20
+  sentiment_analysis:
+    models:
+      - "textblob"
+      - "transformer"
+    thresholds:
+      positive: 0.6
+      negative: -0.6
+  entity_extraction:
+    model: "spacy"
+    min_confidence: 0.8
+    entity_types:
+      - "ORG"
+      - "PERSON"
+      - "GPE"
+      - "MONEY"
+      - "PERCENT"
+      - "DATE"
+      - "TIME"
+
+# Output Settings
+output:
+  raw_format: "json"
+  processed_format: "json"
+  training_format: "jsonl"
+  compression: false
+  backup: true
+  backup_interval: 24  # hours
+  file_naming:
+    pattern: "{category}_{timestamp}_{source}"
+    timestamp_format: "%Y%m%d_%H%M%S"
+  metadata:
+    version: "1.0"
+    collection_date: true
+    source_info: true
+    processing_info: true
+    validation_info: true
+
+# Logging Settings
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/data_collection.log"
+  max_size: 10485760  # 10MB
+  backup_count: 5
+  handlers:
+    - type: "file"
+      level: "INFO"
+    - type: "console"
+      level: "INFO"
+    - type: "error_file"
+      level: "ERROR"
+      file: "logs/errors.log"
+  metrics:
+    collection_rate: true
+    processing_time: true
+    error_rate: true
+    data_quality: true 

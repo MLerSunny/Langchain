@@ -1,0 +1,134 @@
+# Security Configuration
+max_input_length: 1000
+max_file_size: 10485760  # 10MB in bytes
+allowed_file_types:
+  - "pdf"
+  - "txt"
+  - "docx"
+  - "md"
+
+# Rate Limiting
+rate_limits:
+  requests_per_minute: 60  # Standardized with settings.py
+  requests_per_hour: 1000  # Standardized with settings.py
+  burst_limit: 10
+  window_size: 60  # seconds
+  storage: "memory"  # Options: memory, redis
+  redis:
+    host: "localhost"
+    port: 6379
+    db: 0
+    password: ""  # Set in environment variable
+
+# Input Validation
+input_validation:
+  max_query_length: 1000  # Standardized with settings.py
+  sanitize_input: true
+  sanitize_output: true
+  strip_html: true
+  remove_scripts: true
+
+# Authentication
+authentication:
+  jwt_secret: ""  # Set in environment variable
+  jwt_algorithm: "HS256"
+  access_token_expiry: 3600  # 1 hour
+  refresh_token_expiry: 604800  # 7 days
+  token_issuer: "insurance-rag"
+  token_audience: "insurance-rag-api"
+  require_authentication: true
+  allow_anonymous: false
+
+# Authorization
+authorization:
+  roles:
+    - admin
+    - user
+    - guest
+  permissions:
+    admin:
+      - "read"
+      - "write"
+      - "delete"
+      - "manage"
+    user:
+      - "read"
+      - "write"
+    guest:
+      - "read"
+  default_role: "guest"
+
+# Content Security
+content_security:
+  sensitive_patterns:
+    - pattern: "\\b\\d{16}\\b"  # Credit card numbers
+      replacement: "[REDACTED]"
+    - pattern: "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b"  # Email addresses
+      replacement: "[REDACTED]"
+    - pattern: "\\b\\d{3}-\\d{2}-\\d{4}\\b"  # SSN
+      replacement: "[REDACTED]"
+  mask_sensitive_data: true
+  log_sensitive_access: true
+  encryption:
+    enabled: true
+    algorithm: "AES-256-GCM"
+    key_rotation: 30  # days
+
+# API Security
+api_security:
+  cors:
+    enabled: true
+    allowed_origins:
+      - "http://localhost:3000"
+      - "https://yourdomain.com"
+    allowed_methods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+    allowed_headers:
+      - "Authorization"
+      - "Content-Type"
+  rate_limit_by_ip: true
+  rate_limit_by_user: true
+  require_api_key: true
+  api_key_header: "X-API-Key"
+
+# Monitoring and Logging
+monitoring:
+  enabled: true
+  log_level: "INFO"
+  log_security_events: true
+  alert_on_breach: true
+  metrics:
+    - failed_login_attempts
+    - rate_limit_hits
+    - sensitive_data_access
+    - api_usage
+  alerts:
+    email:
+      enabled: true
+      recipients: []  # Set in environment variable
+    slack:
+      enabled: false
+      webhook_url: ""  # Set in environment variable
+
+# Error Handling
+error_handling:
+  hide_error_details: true
+  log_errors: true
+  retry_attempts: 3
+  retry_delay: 1
+  timeout: 30  # seconds
+
+# Feature Flags
+features:
+  two_factor_auth: false
+  password_policy: true
+  session_management: true
+  audit_logging: true
+  ip_whitelist: false
+  brute_force_protection: true
+
+# Additional Security Features
+resource_protection: true 

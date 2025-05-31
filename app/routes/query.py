@@ -1,11 +1,16 @@
 from fastapi import APIRouter, HTTPException, Request, Security, Depends
-from typing import List, Dict, Any, Optional
+from fastapi.responses import StreamingResponse
+from typing import List, Dict, Any, Optional, Union
 import logging
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
+import json
+from datetime import datetime
 
 from app.schemas import QueryRequest, QueryResponse
 from core.settings import settings
+from core.rag_engine import RAGEngine
+from core.auth import validate_token
 
 router = APIRouter(tags=["Query"])
 logger = logging.getLogger(__name__)
@@ -44,41 +49,64 @@ async def query(request_body: QueryRequest, request: Request, user: dict = Depen
         # Store user in request state for middleware/handlers
         request.state.user = user
         
-        context_docs = []
-        sources = []
+        # Get RAG engine instance
+        rag_engine = request.app.state.rag_engine
         
-        # Retrieve context from vector store if available
-        if request.app.state.vectorstore is not None:
-            try:
-                retrieval_results = request.app.state.vectorstore.similarity_search_with_score(
-                    request_body.question, k=request_body.top_k
-                )
-                
-                if retrieval_results:
-                    # Extract documents and metadata
-                    context_docs = [doc for doc, _ in retrieval_results]
-                    sources = [
-                        doc.metadata.get("source", "Unknown")
-                        for doc, _ in retrieval_results
-                    ]
-                    
-            except Exception as e:
-                logger.error(f"Error retrieving from vector store: {e}")
-                # Continue without context
-        
-        # Generate answer using the model
-        answer = await request.app.state.model_client.generate(
-            query=request_body.question,
-            context_docs=context_docs,
-            model=settings.model_name,
-            temperature=request_body.temperature,
-            max_tokens=settings.max_tokens,
-        )
-        
-        return QueryResponse(
-            answer=answer["text"],
-            sources=sources if sources else []
-        )
+        # Process query
+        if request_body.stream:
+            def stream_generator():
+                for chunk, sources in rag_engine.process_query(
+                    query=request_body.question,
+                    stream=True,
+                    reference_answer=request_body.reference_answer
+                ):
+                    yield json.dumps({
+                        "text": chunk,
+                        "sources": sources,
+                        "metadata": {
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "user": user.get("sub", "unknown")
+                        },
+                        "metrics": {
+                            "retrieval_latency": rag_engine.metrics.retrieval_latency,
+                            "generation_latency": rag_engine.metrics.generation_latency,
+                            "cache_hits": rag_engine.metrics.cache_hits,
+                            "cache_misses": rag_engine.metrics.cache_misses,
+                            "token_usage": rag_engine.metrics.token_usage,
+                            "rouge_scores": rag_engine.metrics.rouge_scores,
+                            "bert_scores": rag_engine.metrics.bert_scores
+                        }
+                    }) + "\n"
+            
+            return StreamingResponse(
+                stream_generator(),
+                media_type="application/x-ndjson"
+            )
+        else:
+            # Process query without streaming
+            response, sources = rag_engine.process_query(
+                query=request_body.question,
+                stream=False,
+                reference_answer=request_body.reference_answer
+            )
+            
+            return QueryResponse(
+                answer=response,
+                sources=sources,
+                metadata={
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "user": user.get("sub", "unknown")
+                },
+                metrics={
+                    "retrieval_latency": rag_engine.metrics.retrieval_latency,
+                    "generation_latency": rag_engine.metrics.generation_latency,
+                    "cache_hits": rag_engine.metrics.cache_hits,
+                    "cache_misses": rag_engine.metrics.cache_misses,
+                    "token_usage": rag_engine.metrics.token_usage,
+                    "rouge_scores": rag_engine.metrics.rouge_scores,
+                    "bert_scores": rag_engine.metrics.bert_scores
+                }
+            )
         
     except Exception as e:
         logger.error(f"Error processing query: {e}")

@@ -1,420 +1,282 @@
-# RAG + Fine-tuning System for DeepSeek Models
+# RAG + Fine-tuning System
 
-A complete system for building RAG (Retrieval-Augmented Generation) applications and fine-tuning DeepSeek models on Windows with NVIDIA RTX GPUs.
+This is a Retrieval-Augmented Generation (RAG) system with fine-tuning capabilities, built using FastAPI and LangChain.
 
 ## Features
 
-- Document ingestion pipeline with support for multiple file formats
-- Vector database for semantic search using ChromaDB
-- FastAPI server with RAG-based question answering
-- vLLM integration for faster inference
-- Fine-tuning capabilities using LoRA/QLoRA
-- PowerShell setup script for Windows environments
-- Centralized configuration system for easy customization
-- Unified CLI interface for all system components
-- Streamlit UI for interactive chat experience
+- Document ingestion and vector storage using FAISS
+- Query processing with RAG
+- Model fine-tuning capabilities
+- Metrics tracking
+- RESTful API endpoints
+- Streamlit web interface
 
-## System Requirements
+## Setup
 
-- Windows 10 or higher
-- NVIDIA GPU with at least 8GB VRAM (RTX series recommended)
-- 16GB+ system RAM
-- Python 3.11
-- Administrator access (for setup script)
-
-## Quick Start
-
-### Setup
-
-1. Clone this repository:
-
-   ```
-   git clone <repository-url>
-   cd <repository-name>
-   ```
-
-2. Run the setup script (as Administrator):
-
-   ```
-   make setup
-   ```
-
-   This will install:
-   - CUDA 12.1
-   - PyTorch with CUDA support
-   - Intel oneAPI optimization libraries
-   - bitsandbytes for quantization
-   - All required Python dependencies
-   - Ollama for model hosting
-
-3. Pull the DeepSeek model via Ollama:
-
-   ```
-   make ollama
-   ```
-
-### Using the Unified CLI Interface
-
-The system provides a unified command-line interface for all components:
-
-```
-python main.py <command> [options]
-```
-
-Available commands:
-
-- `ingest`: Ingest documents into the vector database
-- `serve`: Start the RAG API server
-- `finetune`: Fine-tune a DeepSeek model
-- `query`: Query the RAG system directly
-
-Example usage:
-
+1. Create a virtual environment:
 ```bash
-# Ingest documents from a custom directory and rebuild the vector database
-python main.py ingest --source_dir data/custom_docs --rebuild
-
-# Start the API server on a custom port
-python main.py serve --port 9000
-
-# Fine-tune a model with a custom dataset
-python main.py finetune --dataset_dir data/custom_training
-
-# Query the system directly
-python main.py query "What is a retrieval-augmented generation?" --lob general --state CA
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```
 
-### Using the RAG System with Make
-
-1. Prepare your documents by placing them in the `data/raw` directory
-
-2. Ingest the documents into the vector database:
-
-   ```
-   make ingest
-   ```
-
-3. Start the FastAPI server:
-
-   ```
-   make serve
-   ```
-
-4. In a separate terminal, start vLLM for faster inference (optional):
-
-   ```
-   make vllm
-   ```
-
-5. Access the API at <http://localhost:8080>
-
-### Using the Streamlit UI
-
-The system includes a Streamlit chat interface for interacting with the DeepSeek model:
-
+2. Install dependencies:
 ```bash
-# Start the Streamlit app
-make streamlit
-```
-
-or
-
-```bash
-streamlit run streamlit_app.py
-```
-
-Access the UI at <http://localhost:8501>
-
-### Fine-tuning Models
-
-1. Prepare your training data in ShareGPT format (JSON):
-
-   ```json
-   {
-     "conversations": [
-       {"from": "user", "value": "What is the capital of France?"},
-       {"from": "assistant", "value": "The capital of France is Paris."}
-     ]
-   }
-   ```
-
-2. Place your training data in `data/training/` directory
-
-3. Run the fine-tuning process:
-
-   ```
-   python main.py finetune
-   ```
-
-## Configuration System
-
-The system uses a centralized configuration approach with all settings defined in `core/settings.py`. Configuration is loaded from:
-
-1. Environment variables (highest priority)
-2. `core/rag.yaml` for RAG-specific settings
-3. Default values in `core/settings.py`
-
-Key configuration groups:
-
-- **Base directories**: Paths for data, models, and other directories
-- **API server settings**: Host, ports, and API configuration
-- **Model settings**: Default model, Ollama URL, context window, generation parameters
-- **Vector database settings**: ChromaDB configuration, embedding model
-- **RAG settings**: Chunk sizes, retrieval parameters, prompts
-- **Fine-tuning settings**: Training parameters, dataset paths, learning rates
-
-To customize the configuration:
-
-1. Edit `core/rag.yaml` for RAG-specific settings
-2. Set environment variables for temporary changes
-3. Modify `core/settings.py` for permanent changes
-
-Example environment variables:
-
-```bash
-# Set custom directories
-export BASE_DIR=/path/to/custom/dir
-export DATA_DIR=/path/to/data
-
-# Change API settings
-export FASTAPI_PORT=9000
-export VLLM_PORT=8100
-
-# Modify model behavior
-export DEFAULT_MODEL=deepseek-coder:33b-instruct
-export TEMPERATURE=0.2
-export MAX_TOKENS=4096
-```
-
-## Data Organization
-
-The system uses the following data organization:
-
-- `data/raw/` - Original source documents (PDFs, DOCs, etc.)
-- `data/processed/` - Cleaned and processed documents
-- `data/chroma/` - ChromaDB vector database
-- `data/training/` - Training datasets for fine-tuning
-- `data/eval/` - Evaluation datasets for fine-tuning
-- `data/models/` - Fine-tuned models
-
-**Note**: For production deployment, move large sample files to external storage and provide a download script to reduce repository size and Docker build context.
-
-## Pulling DeepSeek Models via Ollama
-
-DeepSeek models can be easily pulled and run using Ollama:
-
-```bash
-# Pull the model
-ollama pull deepseek-coder:7b-instruct-v1.5
-
-# Run the model
-ollama run deepseek-coder:7b-instruct-v1.5
-```
-
-You can also use the provided make command:
-
-```bash
-make ollama
-```
-
-This will pull the latest DeepSeek models and start the Ollama service.
-
-## Fine-tuning Guide
-
-The system supports fine-tuning DeepSeek models using parameter-efficient methods:
-
-1. Prepare your training data in the required format (JSONL with 'prompt' and 'completion' fields)
-
-2. Configure the fine-tuning parameters in `core/settings.py` or pass them as command-line arguments:
-
-   ```bash
-   python scripts/finetune.py \
-     --model_name_or_path deepseek-coder:7b-instruct-v1.5 \
-     --dataset_path data/training/custom_data.jsonl \
-     --eval_dataset_path data/eval/custom_eval.jsonl \
-     --use_lora True \
-     --lora_rank 8 \
-     --use_4bit True
-   ```
-
-3. The fine-tuned model will be saved to the directory specified in `core/settings.py` or passed via `--output_dir`
-
-4. To use the fine-tuned model, you can load it with the `transformers` and `peft` libraries or convert it to GGUF format for use with Ollama
-
-## API Reference
-
-The FastAPI server provides the following endpoints:
-
-- `GET /`: Root endpoint
-- `GET /health`: Health check endpoint
-- `GET /models`: List available models
-- `POST /query`: Query endpoint for RAG-based QA
-
-Example query:
-
-```bash
-curl -X POST http://localhost:8080/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "What is a retrieval-augmented generation?",
-    "model": "deepseek-coder:7b-instruct-v1.5",
-    "temperature": 0.1,
-    "max_tokens": 500,
-    "use_rag": true,
-    "k": 3
-  }'
-```
-
-## Development
-
-### Project Structure
-
-```
-.
-├── app/                  # FastAPI application
-│   ├── main.py           # Main application file
-│   ├── proxy.py          # vLLM proxy implementation
-│   ├── routes/           # API route definitions
-│   └── utils/            # Utility functions
-├── Chatbot-Deepseek/     # Streamlit UI application
-│   └── app.py            # Streamlit app code
-├── core/                 # Core configuration
-│   └── settings.py       # Settings and configuration
-├── data/                 # Data directories
-│   ├── chroma/           # ChromaDB vector store
-│   ├── eval/             # Evaluation datasets
-│   ├── models/           # Fine-tuned models
-│   ├── processed/        # Processed documents
-│   ├── raw/              # Source documents
-│   └── training/         # Training datasets
-├── examples/             # Example notebooks and code
-│   └── app.ipynb         # RAG example notebook
-├── scripts/              # Scripts for various operations
-│   ├── finetune.py       # Fine-tuning script
-│   ├── ingest.py         # Document ingestion script
-│   └── setup.ps1         # Windows setup script
-├── tests/                # Test files
-│   ├── app/              # UI tests
-│   └── test_app.py       # API tests
-├── docker-compose.yml    # Docker compose configuration
-├── Makefile              # Makefile for common operations
-├── README.md             # Project documentation
-└── requirements.txt      # Python dependencies
-```
-
-### Running Tests
-
-```bash
-make test
-```
-
-## License
-
-[MIT License](LICENSE)
-
-## Acknowledgments
-
-- [DeepSeek](https://github.com/deepseek-ai/DeepSeek-Coder) for the base models
-- [LangChain](https://github.com/langchain-ai/langchain) for the RAG framework
-- [vLLM](https://github.com/vllm-project/vllm) for fast inference
-- [Ollama](https://github.com/ollama/ollama) for model hosting
-- [PEFT](https://github.com/huggingface/peft) for parameter-efficient fine-tuning
-
-# Fine-tuning Instructions
-
-This repository includes scripts for fine-tuning language models on custom datasets. The following guide will help you run the fine-tuning process.
-
-## Prerequisites
-
-- Python 3.7+
-- PyTorch
-- Transformers library
-- PEFT (Parameter-Efficient Fine-Tuning) library
-
-## Installation
-
-```bash
-# Install required dependencies
 pip install -r requirements.txt
 ```
 
-## Fine-tuning on Windows
-
-To run fine-tuning on Windows, use the following command:
-
-```powershell
-.\scripts\finetune.ps1 -skipDeepSpeed -modelName facebook/opt-350m
-```
-
-### Troubleshooting Windows Issues
-
-When running on Windows, you might encounter several issues:
-
-1. **Missing DeepSpeed**: If DeepSpeed is not installed or doesn't work on your system, use the `-skipDeepSpeed` flag to use standard training.
-
-2. **CUDA Compatibility**: If CUDA is not available, the script will automatically disable 4-bit quantization and fp16 training.
-
-3. **Model Access**: Some models like `deepseek-ai/deepseek-llm-32b-instruct` require authentication. Use public models like `facebook/opt-350m` if you don't have access.
-
-4. **JWT Secret**: The script contains a validation check for JWT secrets. This has been configured in the `core/settings.py` file.
-
-## Fine-tuning on Linux
-
-To run fine-tuning on Linux, use the following command:
-
+3. Start the FastAPI server:
 ```bash
-./scripts/finetune.sh
+uvicorn app.main:app --reload --port 8000
 ```
 
-## Parameters
-
-The fine-tuning script accepts the following parameters:
-
-- `-modelName`: Model name or path (default: "facebook/opt-350m")
-- `-configFile`: DeepSpeed config file (default: "core/deepspeed_zero3.json")
-- `-outputDir`: Output directory for checkpoints (default: "checkpoints/r1_ins_lora")
-- `-trainEpochs`: Number of training epochs (default: 3)
-- `-batchSize`: Batch size (default: 1)
-- `-gradAccumSteps`: Gradient accumulation steps (default: 8)
-- `-skipDeepSpeed`: Skip using DeepSpeed for training
-
-## Output
-
-The trained model will be saved in the output directory specified by `-outputDir`. The model can then be used for inference or further fine-tuning.
-
-## Recent Fixes
-
-### ShareGPT Conversion Improvements
-- Added proper progress bars for both document chunking and ShareGPT creation processes
-- Fixed progress tracking to show accurate counts during processing
-- Improved thread-safe progress updates with a queue-based mechanism
-- Enhanced display of processing status for better user feedback
-
-### Query RAG System Fixes
-- Fixed the API request payload format to use JSON instead of query parameters
-- Added server health check before attempting queries
-- Improved error handling and feedback for when the RAG server is unavailable
-- Enhanced source document extraction and formatting in results
-- Fixed metadata filtering in vector database queries
-- Added proper display of source documents in the UI
-- Improved error handling in context retrieval
-
-These improvements make the system more robust and user-friendly, with better visual feedback during document processing and more reliable RAG query functionality.
-
-## Using vLLM for Inference
-
-The project now includes a vLLM server in the Docker setup for faster inference. To use it:
-
-1. Make sure you have a compatible GPU with CUDA support
-2. Download a model to the `models` directory (e.g., mistral-7b-instruct-v0.2)
-3. Start all services with Docker Compose:
-   ```bash
-   docker-compose up -d
-   ```
-
-You can specify a different model path using the MODEL_PATH environment variable:
+4. Start the Streamlit interface (in a separate terminal):
 ```bash
-MODEL_PATH=/models/your-custom-model docker-compose up -d
+streamlit run streamlit_app.py --server.port 8501
 ```
 
-By default, the vLLM service will listen on port 8001 and the API will connect to it automatically.
+## API Endpoints
+
+- `GET /health`: Health check endpoint
+- `GET /metrics`: Get system metrics
+- `POST /query`: Process a query through the RAG system
+- `POST /fine-tune`: Start a fine-tuning job
+- `GET /fine-tuning-status/{job_id}`: Get fine-tuning job status
+
+## Usage
+
+1. Add documents to the system:
+```python
+from core.rag import RAGEngine
+
+rag = RAGEngine()
+rag.add_documents(["Your document text here"])
+```
+
+2. Query the system:
+```python
+response, sources = rag.process_query("Your question here")
+```
+
+3. Start fine-tuning:
+```python
+from core.fine_tuning import FineTuningManager
+
+manager = FineTuningManager()
+job_id = manager.start_training(
+    model_name="gpt2",
+    training_data=[{"text": "Your training data"}]
+)
+```
+
+## Architecture
+
+- `app/main.py`: FastAPI application
+- `core/rag.py`: RAG engine implementation
+- `core/metrics.py`: Metrics collection
+- `core/fine_tuning.py`: Fine-tuning management
+- `streamlit_app.py`: Web interface
+
+## License
+
+MIT
+
+# Configuration System
+
+The project uses a comprehensive configuration system to manage all settings and parameters. This makes it easy to customize the behavior of the application without modifying the code.
+
+## Configuration Files
+
+The following configuration files are used:
+
+- `config/model_optimization.yaml`: Model optimization settings
+- `config/rag.yaml`: RAG (Retrieval-Augmented Generation) settings
+- `config/security.yaml`: Security and access control settings
+
+## Creating Configuration Files
+
+To create the initial configuration files with default values, run:
+```bash
+python scripts/create_config.py
+```
+
+This will create all necessary configuration files with sensible defaults. You can then modify these files according to your needs.
+
+## Validating Configuration
+
+To validate your configuration files, run:
+```bash
+python scripts/validate_config.py
+```
+
+This will check all configuration files for:
+- Required sections and fields
+- Correct data types
+- Valid values
+- Security settings
+
+## Configuration Structure
+
+### Model Optimization Configuration
+
+```yaml
+quantization:
+  use_4bit: true
+  use_8bit: false
+  dtype: float16
+  quantization_type: nf4
+
+lora:
+  use_lora: true
+  rank: 8
+  alpha: 16
+  dropout: 0.1
+  target_modules: ["q_proj", "v_proj"]
+  bias: none
+  task_type: CAUSAL_LM
+
+memory:
+  max_memory: 8GB
+  offload_folder: data/offload
+  use_cache: true
+  gradient_checkpointing: true
+  data_loader:
+    num_workers: 4
+    pin_memory: true
+
+training:
+  mixed_precision: fp16
+  optimizer: adamw_torch
+  report_to: ["tensorboard"]
+  data_loader:
+    batch_size: 8
+    gradient_accumulation_steps: 4
+
+model_loading:
+  dtype: float16
+  device_map: auto
+  use_cache: true
+  max_memory: 8GB
+
+tokenizer:
+  padding_token: <pad>
+  max_length: 2048
+  padding_side: right
+  truncation_side: right
+```
+
+### RAG Configuration
+
+```yaml
+chunking:
+  chunk_size: 512
+  chunk_overlap: 50
+  max_chunks: 10
+
+retrieval:
+  similarity_threshold: 0.7
+  max_results: 5
+  rerank: true
+
+vector_store:
+  type: chroma
+  persist_directory: data/chroma
+  collection_name: documents
+
+embeddings:
+  model: sentence-transformers/all-MiniLM-L6-v2
+  cache_dir: data/embeddings_cache
+
+cache:
+  ttl: 3600
+  max_size: 1000
+
+query:
+  query_template: "Answer the following question based on the context: {question}"
+  system_prompt: "You are a helpful AI assistant. Use the provided context to answer questions accurately and concisely."
+
+generation:
+  max_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+
+error_handling:
+  max_retries: 3
+  retry_delay: 1
+  fallback_model: gpt-3.5-turbo
+```
+
+### Security Configuration
+
+```yaml
+rate_limits:
+  requests_per_minute: 60
+  requests_per_hour: 1000
+  max_query_length: 1000
+
+file_validation:
+  max_file_size: 10485760  # 10MB
+  allowed_types: [".txt", ".pdf", ".json", ".csv", ".md"]
+
+input_validation:
+  max_length: 10000
+  sensitive_patterns:
+    - \b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b  # Email
+    - \b\d{3}[-.]?\d{3}[-.]?\d{4}\b  # Phone
+    - \b\d{16}\b  # Credit card
+    - \b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b  # API key
+
+security_headers:
+  x_frame_options: DENY
+  x_content_type_options: nosniff
+  x_xss_protection: "1; mode=block"
+  strict_transport_security: "max-age=31536000; includeSubDomains"
+
+jwt:
+  access_token_expiry: 3600  # 1 hour
+  refresh_token_expiry: 604800  # 7 days
+  algorithm: HS256
+
+cors:
+  allowed_origins: ["*"]
+  allowed_methods: ["GET", "POST", "PUT", "DELETE"]
+  allowed_headers: ["*"]
+  exposed_headers: ["Content-Length", "X-Request-ID"]
+  max_age: 3600
+
+password_policy:
+  min_length: 12
+  require_uppercase: true
+  require_lowercase: true
+  require_numbers: true
+  require_special: true
+  max_age_days: 90
+  history_size: 5
+
+session:
+  timeout_minutes: 30
+  max_failed_attempts: 5
+  lockout_duration_minutes: 15
+
+api_security:
+  max_requests_per_ip: 1000
+  max_requests_per_user: 100
+  require_api_key: true
+```
+
+## Environment Variables
+
+The following environment variables can be used to override configuration file paths:
+
+- `MODEL_OPTIMIZATION_CONFIG_PATH`: Path to model optimization configuration file
+- `RAG_CONFIG_PATH`: Path to RAG configuration file
+- `SECURITY_CONFIG_PATH`: Path to security configuration file
+
+## Best Practices
+
+1. Always validate your configuration files before deploying
+2. Use environment variables for sensitive information
+3. Keep configuration files in version control
+4. Document any changes to configuration structure
+5. Use the validation script to catch configuration errors early

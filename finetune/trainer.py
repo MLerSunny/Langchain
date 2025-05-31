@@ -388,6 +388,9 @@ class RAGEvaluationCallback(TrainerCallback):
             
             # Tokenize the prompt
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            # Move inputs to GPU if CUDA is available
+            if torch.cuda.is_available():
+                inputs = {k: v.cuda() for k, v in inputs.items()}
             
             # Generate the answer
             with torch.no_grad():
@@ -532,10 +535,22 @@ def train(model_args, data_args, lora_args, training_args, eval_args):
     trainer.train()
 
 
+# Add a new function to test CUDA availability and GPU-based fine-tuning
+def test_cuda():
+    if torch.cuda.is_available():
+        logger.info("CUDA is available. GPU-based fine-tuning will be used.")
+        logger.info(f"GPU Device: {torch.cuda.get_device_name(0)}")
+    else:
+        logger.warning("CUDA is not available. Fine-tuning will be very slow on CPU.")
+
+
 def main():
     """
     Parse command line arguments and start training.
     """
+    # Test CUDA availability
+    test_cuda()
+    
     parser = argparse.ArgumentParser(description="Fine-tune DeepSeek LLM with QLoRA")
     parser.add_argument("--model_name", type=str, required=True, help="Model name or path")
     parser.add_argument("--dataset_dir", type=str, required=True, help="Path to dataset directory")

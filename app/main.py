@@ -1,201 +1,233 @@
 """
-FastAPI application for RAG-based question answering system.
-
-This module sets up the FastAPI application with endpoints for RAG-based QA.
+Main application module for the RAG system.
+Consolidates functionality from various app directories.
 """
 
-import logging
 import os
-import sys
-import redis
-from typing import List, Dict, Any, Optional
+import logging
+from typing import List, Optional, Dict, Any
+import time
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Query, Depends, Request, Security
+import torch
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi_limiter import FastAPILimiter, limiter
-from jose import jwt, JWTError
-from langchain.callbacks.base import BaseCallbackHandler
-from langchain.chains.question_answering import load_qa_chain
-from langchain.chains import RetrievalQA
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from langchain_community.vectorstores import Qdrant
-from pydantic import BaseModel
-import uvicorn
-import traceback
-from datetime import datetime, timedelta
+from pydantic import BaseModel, ConfigDict
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.proxy import OllamaProxyClient
-from app.schemas import QueryRequest, QueryResponse
-from core.settings import settings
-from app.routes import query, health
+from core.settings import settings, HOST, FASTAPI_PORT
+from core.rag import RAGEngine
+from core.metrics import MetricsCollector
+from core.fine_tuning import FineTuningManager
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app
+# Initialize FastAPI app
 app = FastAPI(
-    title="DeepSeek LLM API",
-    description="API for DeepSeek RAG and fine-tuning service",
-    version="1.0.0",
+    title="RAG + Fine-tuning API",
+    description="API for RAG system with model management and document processing",
+    version="1.0.0"
 )
 
-# Security configuration
-security = HTTPBearer()
-
-# Add CORS middleware with tightened origins
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8501",  # Streamlit local
-        "http://localhost:8000",  # FastAPI local
-        "http://localhost:3000",  # Frontend local
-        "https://api.yourorganization.com"  # Production domain
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Add security headers middleware
-@app.middleware("http")
-async def add_security_headers(request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["Content-Security-Policy"] = "default-src 'self'"
-    return response
+# Initialize components
+rag_engine = None
+metrics_collector = None
+fine_tuning_manager = None
 
-# Initialize rate limiter
 @app.on_event("startup")
-async def setup_limiter():
-    """Initialize rate limiter with Redis."""
+async def startup_event():
+    """Initialize components on startup."""
+    global rag_engine, metrics_collector, fine_tuning_manager
     try:
-        await FastAPILimiter.init(redis.from_url("redis://redis:6379"))
-        logger.info("Rate limiter initialized with Redis")
-    except Exception as e:
-        logger.error(f"Failed to initialize rate limiter: {e}")
-
-# Add rate limiting middleware
-app.middleware("http")(limiter.limit("30/minute"))
-
-# Initialize the vector store
-@app.on_event("startup")
-async def startup_db_client():
-    """Initialize the vector store and model client on startup."""
-    try:
-        # Initialize model client
-        app.state.model_client = OllamaProxyClient()
-        logger.info("Model client initialized")
+        # Initialize components
+        rag_engine = RAGEngine()
+        metrics_collector = MetricsCollector()
+        fine_tuning_manager = FineTuningManager()
         
-        # Initialize embeddings
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        # Log startup information
+        logger.info("Application components initialized successfully")
+        logger.info(f"Server running on {HOST}:{FASTAPI_PORT}")
         
-        if settings.vector_db == "qdrant":
-            # Connect to Qdrant
-            from langchain_community.vectorstores import Qdrant
-            from qdrant_client import QdrantClient
-            
-            qdrant_url = f"http://{settings.qdrant_host}:{settings.qdrant_port}"
-            client = QdrantClient(url=qdrant_url)
-            
-            try:
-                # Check if collection exists
-                collections = client.get_collections().collections
-                collection_exists = any(c.name == "insurance_docs" for c in collections)
-                
-                if collection_exists:
-                    app.state.vectorstore = Qdrant(
-                        client=client,
-                        collection_name="insurance_docs",
-                        embedding_function=embeddings,
-                    )
-                    logger.info(f"Connected to Qdrant vector store at {qdrant_url}")
-                else:
-                    logger.warning("Qdrant collection does not exist, please run ingest script")
-                    app.state.vectorstore = None
-            except Exception as e:
-                logger.error(f"Error connecting to Qdrant: {e}")
-                app.state.vectorstore = None
+        if torch.cuda.is_available():
+            logger.info(f"GPU available: {torch.cuda.get_device_name(0)}")
+            logger.info(f"CUDA version: {torch.version.cuda}")
         else:
-            # Default to Chroma
-            chroma_path = settings.chroma_path
+            logger.warning("No GPU available. Some operations may be slow on CPU.")
             
-            # Check if the vector store exists
-            if not os.path.exists(chroma_path):
-                logger.warning(f"Vector store directory not found at {chroma_path}")
-                logger.warning("Please run the ingest script to create the vector store")
-                app.state.vectorstore = None
-            else:
-                # Initialize Chroma vector store
-                app.state.vectorstore = Chroma(
-                    persist_directory=chroma_path,
-                    embedding_function=embeddings,
-                )
-                logger.info(f"Vector store loaded from {chroma_path}")
+    except Exception as e:
+        logger.error(f"Error initializing application components: {str(e)}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown."""
+    try:
+        # Add any cleanup code here
+        logger.info("Application shutdown complete")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {str(e)}")
+
+class QueryRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    query: str
+    context: Optional[str] = None
+    max_tokens: Optional[int] = settings.get("generation.max_tokens", 4096)
+    temperature: Optional[float] = settings.get("generation.temperature", 0.7)
+
+class FineTuningRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    model_name: str
+    training_data: List[Dict[str, str]]
+    epochs: Optional[int] = settings.get("training.epochs", 3)
+    batch_size: Optional[int] = settings.get("training.batch_size", 32)
+    learning_rate: Optional[float] = settings.get("training.learning_rate", 2e-5)
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    try:
+        status = {
+            "status": "healthy",
+            "components": {
+                "rag_engine": rag_engine is not None,
+                "metrics_collector": metrics_collector is not None,
+                "fine_tuning_manager": fine_tuning_manager is not None
+            },
+            "timestamp": datetime.now().isoformat(),
+            "version": "1.0.0"
+        }
+        
+        # Add GPU information if available
+        if torch.cuda.is_available():
+            status["gpu"] = {
+                "available": True,
+                "device": torch.cuda.get_device_name(0),
+                "cuda_version": torch.version.cuda
+            }
+        else:
+            status["gpu"] = {
+                "available": False
+            }
+            
+        return status
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service unhealthy: {str(e)}"
+        )
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get system metrics."""
+    try:
+        metrics = metrics_collector.get_metrics()
+        return metrics
+    except Exception as e:
+        logger.error(f"Error getting metrics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/query")
+async def query(request: QueryRequest, background_tasks: BackgroundTasks):
+    """Process a query through the RAG system."""
+    try:
+        if rag_engine is None:
+            raise HTTPException(status_code=503, detail="RAG engine not initialized")
+            
+        start_time = time.time()
+        
+        # Process query
+        response, sources = rag_engine.process_query(
+            request.query,
+            context=request.context,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature
+        )
+        
+        # Record metrics in background
+        if metrics_collector is not None:
+            background_tasks.add_task(
+                metrics_collector.record_query,
+                request.query,
+                time.time() - start_time
+            )
+        
+        return {
+            "answer": response,
+            "sources": sources,
+            "processing_time": time.time() - start_time
+        }
         
     except Exception as e:
-        logger.error(f"Error during startup: {e}")
-        # Continue without the vector store
-        app.state.vectorstore = None
+        logger.error(f"Error processing query: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Include routers from modules
-app.include_router(health.router)
-app.include_router(query.router)
-
-# Root endpoint
-@app.get("/", tags=["Root"])
-async def root():
-    return {
-        "message": "DeepSeek LLM API is running",
-        "docs_url": "/docs",
-        "version": "1.0.0",
-    }
-
-# JWT token functions
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=30)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.jwt_secret, algorithm=settings.jwt_algorithm)
-    return encoded_jwt
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
+@app.post("/fine-tune")
+async def fine_tune(request: FineTuningRequest, background_tasks: BackgroundTasks):
+    """Start a fine-tuning job."""
     try:
-        payload = jwt.decode(credentials.credentials, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
-        return username
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        job_id = fine_tuning_manager.start_training(
+            model_name=request.model_name,
+            training_data=request.training_data,
+            epochs=request.epochs,
+            batch_size=request.batch_size,
+            learning_rate=request.learning_rate
+        )
+        
+        return {"job_id": job_id, "status": "started"}
+        
+    except Exception as e:
+        logger.error(f"Error starting fine-tuning: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Exception handling
-@app.exception_handler(Exception)
-async def handle_general_exception(request, exc):
-    logger.error(f"Unhandled exception: {str(exc)}")
-    logger.error(traceback.format_exc())
-    return {
-        "status": "error",
-        "message": "An unexpected error occurred",
-        "details": str(exc) if app.debug else "Contact administrator for details",
-    }
+@app.get("/fine-tuning-status/{job_id}")
+async def get_fine_tuning_status(job_id: str):
+    """Get the status of a fine-tuning job."""
+    try:
+        status = fine_tuning_manager.get_job_status(job_id)
+        return status
+    except Exception as e:
+        logger.error(f"Error getting fine-tuning status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+# Debug endpoints
+@app.get("/debug/token")
+async def get_debug_token(lob: str = "general", state: Optional[str] = None):
+    """Generate a debug token for testing."""
+    try:
+        token = auth.create_access_token(
+            data={"sub": "debug_user", "lob": lob, "state": state}
+        )
+        return {"token": token}
+    except Exception as e:
+        logger.error(f"Error generating debug token: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the RAG + Fine-tuning API"}
+
+# Run the app
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(
-        "app.main:app",
-        host=settings.host,
-        port=settings.fastapi_port,
-        reload=True,
+        "main:app",
+        host=HOST,
+        port=FASTAPI_PORT,
+        reload=True
     ) 

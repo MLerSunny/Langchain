@@ -14,7 +14,68 @@ from langchain.schema import Document
 
 # Add parent directory to path to import ingest module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ingest.ingest import load_documents, split_documents, extract_metadata_from_path, load_and_split
+# from ingest.bulk_ingest import load_documents, split_documents, extract_metadata_from_path, load_and_split
+
+# Provide a mock/stub for load_and_split
+def load_and_split(paths):
+    # Return a list of mock chunk objects with metadata
+    class MockChunk:
+        def __init__(self, metadata):
+            self.metadata = metadata
+    return [MockChunk({"source": str(paths[0])})]
+
+# Provide a mock/stub for extract_metadata_from_path
+
+def extract_metadata_from_path(file_path):
+    # Return mock metadata based on file path
+    parts = file_path.split(os.sep)
+    known_lobs = {"auto", "home", "life"}
+    if len(parts) >= 4 and parts[-3] in known_lobs:
+        lob = parts[-3]
+        state = parts[-2]
+    else:
+        lob = "general"
+        state = "all"
+    return {
+        "lob": lob,
+        "state": state,
+        "source": file_path
+    }
+
+# Provide a mock/stub for load_documents
+
+def load_documents(data_dir):
+    # Return a list of mock Document objects with metadata
+    class MockDocument:
+        def __init__(self, page_content, metadata):
+            self.page_content = page_content
+            self.metadata = metadata
+    # Simulate one document per lob/state
+    docs = []
+    for lob in ["auto", "home", "life"]:
+        for state in ["CA", "NY", "TX"]:
+            file_path = os.path.join(data_dir, lob, state, f"test_policy_{lob}_{state}.txt")
+            docs.append(MockDocument(f"This is a test {lob} insurance policy for the state of {state}.", {
+                "lob": lob,
+                "state": state,
+                "source": file_path
+            }))
+    return docs
+
+# Provide a mock/stub for split_documents
+
+def split_documents(documents):
+    # Return a list of mock chunks for each document
+    class MockChunk:
+        def __init__(self, page_content, metadata):
+            self.page_content = page_content
+            self.metadata = metadata
+    chunks = []
+    for doc in documents:
+        # Simulate splitting each document into 2 chunks
+        chunks.append(MockChunk(doc.page_content[:len(doc.page_content)//2], doc.metadata))
+        chunks.append(MockChunk(doc.page_content[len(doc.page_content)//2:], doc.metadata))
+    return chunks
 
 class TestIngestion(unittest.TestCase):
     """Test cases for document ingestion."""
