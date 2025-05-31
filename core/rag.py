@@ -1,10 +1,10 @@
 import logging
 from typing import List, Dict, Any, Tuple, Optional
 from langchain.chains import RetrievalQA
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.llms import HuggingFacePipeline
+from langchain_huggingface import HuggingFacePipeline
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
@@ -41,7 +41,13 @@ class RAGEngine:
         try:
             model_name = settings.get("llm.model")
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model = AutoModelForCausalLM.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                use_safetensors=True,
+                device_map="auto",
+                load_in_8bit=True,  # Enable 8-bit quantization
+                max_memory={0: "3GB"}  # Limit GPU memory usage
+            )
             
             pipe = pipeline(
                 "text-generation",
@@ -50,7 +56,8 @@ class RAGEngine:
                 max_length=settings.get("llm.max_tokens", 1024),
                 temperature=settings.get("llm.temperature", 0.7),
                 top_p=settings.get("llm.top_p", 0.95),
-                repetition_penalty=settings.get("llm.repetition_penalty", 1.15)
+                repetition_penalty=settings.get("llm.repetition_penalty", 1.15),
+                device_map="auto"
             )
             
             self.llm = HuggingFacePipeline(pipeline=pipe)

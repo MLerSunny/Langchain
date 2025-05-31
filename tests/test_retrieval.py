@@ -13,7 +13,6 @@ import pytest
 from typing import List
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import OpenAIEmbeddings
 
 # Add parent directory to path to import modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,7 +31,6 @@ class TestRetrieval:
     def setup(self):
         """Set up test environment."""
         # Initialize vector store
-        self.embeddings = OpenAIEmbeddings()
         self.db = Chroma(
             collection_name="test_collection",
             embedding_function=self.embeddings,
@@ -103,14 +101,6 @@ class TestRetrieval:
     @classmethod
     def setup_class(cls):
         """Set up test environment once before all tests."""
-        # Initialize the embedding model
-        cls.embedding_model = OpenAIEmbeddings(
-            model="text-embedding-ada-002",
-            deployment="text-embedding-ada-002",
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            chunk_size=1000
-        )
-        
         # Make sure test data exists
         assert os.path.exists(TEST_DATA_DIR), f"Test data directory {TEST_DATA_DIR} does not exist"
         

@@ -13,7 +13,6 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from langchain_community.cache import InMemoryCache
-from langchain_community.chat_models import ChatOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 import tiktoken
 import spacy
@@ -26,6 +25,7 @@ import torch
 from langchain_community.llms.huggingface_pipeline import HuggingFacePipeline
 from core.settings import settings
 from core.exceptions import RAGError
+from vllm import LLM, SamplingParams
 
 # Configure logging
 logging.basicConfig(
@@ -282,21 +282,26 @@ class RAGEngine:
             raise RAGError(f"Failed to initialize vector store: {str(e)}")
     
     def _initialize_llm(self):
-        """Initialize the language model."""
+        """Initialize the vLLM language model for inference."""
         try:
-            generation_config = self.config['generation']
-            return ChatOpenAI(
-                model=generation_config['model'],
-                temperature=generation_config['temperature'],
-                max_tokens=generation_config['max_tokens'],
-                top_p=generation_config['top_p'],
-                frequency_penalty=generation_config['frequency_penalty'],
-                presence_penalty=generation_config['presence_penalty'],
-                stop=generation_config['stop_sequences']
+            llm_config = self.config['llm']
+            self.sampling_params = SamplingParams(
+                temperature=llm_config.get('temperature', 0.7),
+                top_p=llm_config.get('top_p', 0.95),
+                max_tokens=llm_config.get('max_tokens', 4096),
+                frequency_penalty=llm_config.get('frequency_penalty', 0.0),
+                presence_penalty=llm_config.get('presence_penalty', 0.0)
+            )
+            self.llm = LLM(
+                model=llm_config['model'],
+                dtype="auto",
+                tensor_parallel_size=self.config.get('optimization', {}).get('tensor_parallel_size', 1),
+                gpu_memory_utilization=self.config.get('optimization', {}).get('gpu_memory_utilization', 0.9),
+                max_model_len=llm_config.get('max_tokens', 4096)
             )
         except Exception as e:
-            logger.error(f"Error initializing LLM: {str(e)}")
-            raise RAGError(f"Failed to initialize LLM: {str(e)}")
+            logger.error(f"Error initializing vLLM: {str(e)}")
+            raise RAGError(f"Failed to initialize vLLM: {str(e)}")
 
     def _initialize_prompt_template(self):
         """Initialize the prompt template."""
@@ -698,67 +703,36 @@ Assistant: Let me help you with that based on the provided context."""
         stream: bool = False,
         reference_answer: Optional[str] = None
     ) -> Union[Tuple[str, List[Document]], Iterator[Tuple[str, List[Document]]]]:
-        """Generate a response based on query and retrieved documents.
-        
-        Args:
-            query: The user query
-            documents: Retrieved documents
-            stream: Whether to stream the response
-            reference_answer: Optional reference answer for evaluation
-            
-        Returns:
-            If stream=False: Tuple of (response, sources)
-            If stream=True: Iterator of (response_chunk, sources)
+        """
+        Generate a response using vLLM.
         """
         try:
-            # Extract sources from documents
-            sources = [{"content": doc.page_content, "metadata": doc.metadata} for doc in documents]
-            
-            # Prepare context from documents
+            # Prepare context from retrieved documents
             context = "\n".join([doc.page_content for doc in documents])
-            
-            # Truncate context if needed
-            max_tokens = self.config['generation']['max_source_tokens']
-            context = self._truncate_context(context, max_tokens)
-            
-            # Format prompt
-            prompt = self.config['query']['query_template'].format(query=query)
-            
-            if stream:
-                def stream_generator():
-                    try:
-                        start_time = time.time()
-                        # Get streaming response from LLM
-                        for chunk in self.llm.stream(prompt):
-                            yield chunk, sources
-                        # Update metrics after streaming completes
-                        elapsed = time.time() - start_time
-                        self.metrics.generation_latency = elapsed if elapsed > 0 else 0.001
-                        self.metrics.token_usage = len(str(chunk)) if chunk else 1
-                    except Exception as e:
-                        logger.error(f"Error in stream generation: {str(e)}")
-                        yield self.config['error_handling']['fallback_responses']['generation_error'], []
-                return stream_generator()
-            else:
-                # Get non-streaming response
-                start_time = time.time()
-                response = self.llm.invoke(prompt)
-                elapsed = time.time() - start_time
-                self.metrics.generation_latency = elapsed if elapsed > 0 else 0.001
-                # Set token usage to a positive integer
-                self.metrics.token_usage = len(str(response)) if response else 1
-                return response, sources
+            prompt = self.config['query']['query_template'].format(query=query, context=context)
+
+            # vLLM expects a list of prompts
+            start_time = time.time()
+            outputs = self.llm.generate(
+                prompts=[prompt],
+                sampling_params=self.sampling_params
+            )
+            elapsed = time.time() - start_time
+            response = outputs[0].outputs[0].text  # Get the generated text
+
+            # Metrics: latency and token usage
+            self.metrics.generation_latency = elapsed if elapsed > 0 else 0.001
+            self.metrics.token_usage += len(response.split())  # Approximate token count
+
+            sources = [{"content": doc.page_content, "metadata": doc.metadata} for doc in documents]
+            return response, sources
+
         except Exception as e:
-            logger.error(f"Error generating response: {str(e)}")
-            if stream:
-                def fallback_stream():
-                    yield self.config['error_handling']['fallback_responses']['generation_error'], []
-                return fallback_stream()
-            else:
-                return (
-                    self.config['error_handling']['fallback_responses']['generation_error'],
-                    []
-                )
+            logger.error(f"Error generating response with vLLM: {str(e)}", exc_info=True)
+            return (
+                self.config['error_handling']['fallback_responses']['generation_error'],
+                []
+            )
 
     def process_query(
         self,

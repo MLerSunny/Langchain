@@ -93,7 +93,9 @@ class ProcessingMetrics:
         """Calculate overall progress percentage"""
         if self.total_documents == 0:
             return 0.0
-        return (self.processed_documents / self.total_documents) * 100
+        # Ensure progress doesn't exceed 100%
+        progress = (self.processed_documents / self.total_documents) * 100
+        return min(progress, 100.0)
     
     def get_memory_usage(self) -> str:
         """Get current memory usage in MB"""
@@ -122,20 +124,35 @@ class ProcessingMetrics:
 # Create global metrics instance
 metrics = ProcessingMetrics()
 
-def check_llm_availability(max_retries: int = 3, retry_delay: int = 2) -> bool:
+def check_llm_availability(max_retries: int = None, retry_delay: int = None) -> bool:
     """
-    Check if the LLM service (Ollama) is available with retry logic.
-    Only checks if the model specified in config is available. Does not override config.
+    Check if the Ollama LLM service is available with retry logic.
+    Uses configuration for all parameters.
     """
     global LLM_AVAILABLE
     if LLM_AVAILABLE is not None:
         return LLM_AVAILABLE
-    model_name = settings.get("llm.model")
+
+    # Get configuration
+    sharegpt_config = settings.get("sharegpt", {})
+    ollama_config = sharegpt_config.get("ollama_llm", {})
+    error_config = sharegpt_config.get("error_handling", {})
+
+    # Get all parameters from config
+    model = ollama_config["model"]
+    base_url = ollama_config["base_url"]
+    timeout = ollama_config["timeout"]
+    max_retries = max_retries or error_config["retry_attempts"]
+    retry_delay = retry_delay or error_config["retry_delay"] / 1000  # Convert to seconds
+
+    # Log the model we're checking for
+    logger.info(f"Checking availability of Ollama model: {model}")
+
     for attempt in range(max_retries):
         try:
             response = requests.get(
-                f"{OLLAMA_BASE_URL}/api/tags",
-                timeout=10
+                f"{base_url}/api/tags",
+                timeout=timeout
             )
             if response.status_code != 200:
                 logger.warning(f"Ollama server returned status code {response.status_code} (attempt {attempt + 1}/{max_retries})")
@@ -144,15 +161,21 @@ def check_llm_availability(max_retries: int = 3, retry_delay: int = 2) -> bool:
                     continue
                 LLM_AVAILABLE = False
                 return False
+
             models = response.json().get("models", [])
             model_names = [model.get("name") for model in models]
-            if model_name in model_names:
-                logger.info(f"Model '{model_name}' from config is available.")
+            
+            # Check for both exact match and model name without version
+            model_base = model.split(":")[0] if ":" in model else model
+            if model in model_names or any(m.startswith(model_base) for m in model_names):
+                logger.info(f"Model '{model}' from config is available.")
                 LLM_AVAILABLE = True
                 return True
-            logger.warning(f"Model '{model_name}' from config not found in available models: {model_names}")
+
+            logger.warning(f"Model '{model}' from config not found in available models: {model_names}")
             LLM_AVAILABLE = False
             return False
+
         except requests.exceptions.RequestException as e:
             logger.error(f"Error connecting to Ollama (attempt {attempt + 1}/{max_retries}): {str(e)}")
             if attempt < max_retries - 1:
@@ -164,6 +187,7 @@ def check_llm_availability(max_retries: int = 3, retry_delay: int = 2) -> bool:
             logger.error(f"Unexpected error checking LLM availability: {str(e)}")
             LLM_AVAILABLE = False
             return False
+
     LLM_AVAILABLE = False
     return False
 
@@ -224,32 +248,33 @@ def load_documents(source_dir: str) -> List[Document]:
                 if file_ext in loaders:
                     if file_ext == ".json":
                         try:
-                            # First try with content field
-                            loader = loaders[file_ext](
-                                file_path,
-                                text_content=True,
-                                jq_schema=".content"
-                            )
-                            docs = loader.load()
-                        except Exception as e:
-                            logger.warning(f"Failed to load JSON with .content schema, trying alternative: {str(e)}")
+                            # First try with jq if available
                             try:
-                                # Try with text field
+                                import jq
                                 loader = loaders[file_ext](
                                     file_path,
                                     text_content=True,
-                                    jq_schema=".text"
+                                    jq_schema=".content"
                                 )
                                 docs = loader.load()
-                            except Exception as e:
-                                logger.warning(f"Failed to load JSON with .text schema, trying raw content: {str(e)}")
-                                # Try loading raw JSON content
+                            except ImportError:
+                                # If jq not available, try direct JSON loading
                                 with open(file_path, 'r', encoding='utf-8') as f:
                                     content = json.load(f)
                                     if isinstance(content, dict):
-                                        # Convert dict to string representation
-                                        content = json.dumps(content, ensure_ascii=False)
-                                    docs = [Document(page_content=str(content), metadata=metadata)]
+                                        # Try to find content in common fields
+                                        for field in ['content', 'text', 'body', 'data']:
+                                            if field in content:
+                                                docs = [Document(page_content=str(content[field]), metadata=metadata)]
+                                                break
+                                        else:
+                                            # If no content field found, use the whole JSON
+                                            docs = [Document(page_content=json.dumps(content, ensure_ascii=False), metadata=metadata)]
+                                    else:
+                                        docs = [Document(page_content=str(content), metadata=metadata)]
+                        except Exception as e:
+                            logger.warning(f"Error loading JSON file {file_path}: {str(e)}")
+                            continue
                     else:
                         loader = loaders[file_ext](file_path)
                         docs = loader.load()
@@ -388,49 +413,124 @@ def rule_based_question_generation(content: str, num_questions: int = 3) -> List
     
     return questions
 
-def generate_questions_from_content(content: str, num_questions: int = 3) -> List[str]:
+def generate_questions_from_content(content: str, num_questions: int = None) -> List[str]:
     """
-    Generate questions from content using LLM or rule-based approach.
-    
-    Args:
-        content: Text content to generate questions from
-        num_questions: Number of questions to generate
-        
-    Returns:
-        List of generated questions
+    Generate questions from content using Ollama LLM or rule-based approach.
+    Fully config-driven implementation.
     """
     try:
+        # Get all configuration
+        sharegpt_config = settings.get("sharegpt", {})
+        ollama_config = sharegpt_config.get("ollama_llm", {})
+        query_config = sharegpt_config.get("query", {})
+        error_config = sharegpt_config.get("error_handling", {})
+        
+        # Get number of questions from config if not provided
+        num_questions = num_questions or query_config["questions_per_chunk"]
+        
+        # Get all parameters from config
+        model = ollama_config["model"]
+        base_url = ollama_config["base_url"]
+        temperature = ollama_config["temperature"]
+        max_tokens = ollama_config["max_tokens"]
+        top_p = ollama_config["top_p"]
+        timeout = ollama_config["timeout"]
+        
+        # Get query configuration
+        prompt_template = query_config["query_template"]
+        response_format = query_config["response_format"]
+        min_question_length = query_config["min_question_length"]
+        max_question_length = query_config["max_question_length"]
+        
+        # Get error handling configuration
+        fallback_enabled = error_config["use_fallback"]
+        max_retries = error_config["retry_attempts"]
+        retry_delay = error_config["retry_delay"] / 1000  # Convert to seconds
+        fallback_strategy = error_config["fallback_strategy"]
+        
         # Check if LLM is available
-        if check_llm_availability():
-            # Use LLM for question generation
-            prompt = f"""Generate {num_questions} relevant questions based on the following content.
-            The questions should be specific, clear, and test understanding of key concepts.
-            
-            Content:
-            {content}
-            
-            Questions:"""
-            
-            response = requests.post(
-                f"{OLLAMA_BASE_URL}/api/generate",
-                json={
-                    "model": settings.get("llm.model"),
-                    "prompt": prompt,
-                    "stream": False
-                }
+        if check_llm_availability(max_retries, retry_delay):
+            # Format prompt using template
+            prompt = prompt_template.format(
+                num_questions=num_questions,
+                content=content[:4000]  # Limit content length to prevent timeouts
             )
             
-            if response.status_code == 200:
-                questions = response.json()["response"].split("\n")
-                questions = [q.strip() for q in questions if q.strip()]
-                return questions[:num_questions]
+            # Make API request with retries
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(
+                        f"{base_url}/api/generate",
+                        json={
+                            "model": model,
+                            "prompt": prompt,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens,
+                            "top_p": top_p,
+                            "stream": False
+                        },
+                        timeout=timeout
+                    )
+                    
+                    if response.status_code == 200:
+                        # Parse response using configured format
+                        if response_format == "newline":
+                            questions = response.json()["response"].split("\n")
+                        elif response_format == "json":
+                            questions = response.json()["response"].get("questions", [])
+                        else:  # raw
+                            questions = [response.json()["response"]]
+                            
+                        # Filter questions based on length constraints
+                        questions = [
+                            q.strip() for q in questions 
+                            if q.strip() and 
+                            min_question_length <= len(q.strip()) <= max_question_length
+                        ]
+                        return questions[:num_questions]
+                        
+                    logger.warning(f"Ollama API returned status code {response.status_code} (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                        
+                except requests.exceptions.Timeout:
+                    logger.warning(f"Request timed out (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Request error (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                except Exception as e:
+                    logger.error(f"Unexpected error in API request (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
         
-        # Fallback to rule-based approach
-        return rule_based_question_generation(content, num_questions)
-        
+        # Handle fallback based on configured strategy
+        if fallback_enabled:
+            logger.info(f"Falling back to {fallback_strategy} question generation")
+            if fallback_strategy == "rule_based":
+                return rule_based_question_generation(content, num_questions)
+            elif fallback_strategy == "simple":
+                return [f"Question {i+1} about the content" for i in range(num_questions)]
+            else:  # none
+                return []
+        else:
+            logger.error("LLM unavailable and fallback disabled")
+            return []
+            
     except Exception as e:
         logger.error(f"Error generating questions: {str(e)}", exc_info=True)
-        return rule_based_question_generation(content, num_questions)
+        if fallback_enabled:
+            if fallback_strategy == "rule_based":
+                return rule_based_question_generation(content, num_questions)
+            elif fallback_strategy == "simple":
+                return [f"Question {i+1} about the content" for i in range(num_questions)]
+        return []
 
 def enhance_answer(content: str, question: str) -> str:
     """
@@ -522,7 +622,13 @@ def process_document_chunk(chunk_data):
         
         # Generate questions based on the content
         try:
-            questions = generate_questions_from_content(content, questions_per_chunk)
+            # Check LLM availability before attempting to generate questions
+            if not check_llm_availability():
+                logger.warning("LLM service unavailable, using fallback question generation")
+                questions = rule_based_question_generation(content, questions_per_chunk)
+            else:
+                questions = generate_questions_from_content(content, questions_per_chunk)
+                
             if not questions:
                 logger.warning(f"No questions generated for chunk {i}")
                 return []
@@ -537,7 +643,7 @@ def process_document_chunk(chunk_data):
                 
             try:
                 # Create the answer
-                if enhance_answers:
+                if enhance_answers and check_llm_availability():
                     answer = enhance_answer(content, q)
                 else:
                     answer = content
@@ -750,20 +856,24 @@ def main():
         args = parser.parse_args()
         
         # Log the model name from config
-        logger.info(f"Using model from config: {settings.get('llm.model')}")
+        sharegpt_config = settings.get("sharegpt", {})
+        ollama_config = sharegpt_config.get("ollama_llm", {})
+        logger.info(f"Using Ollama model from config: {ollama_config.get('model')}")
+        
         # Check if LLM is available
         llm_status = "available" if check_llm_availability() else "unavailable"
         logger.info(f"LLM service status: {llm_status}")
         
         # Load documents from all source directories
         all_documents = []
+        total_docs = 0
         for source_dir in args.source_dirs:
             logger.info(f"Processing documents from {source_dir}")
             try:
                 documents = load_documents(source_dir)
                 if documents:
                     all_documents.extend(documents)
-                    metrics.processed_documents += len(documents)
+                    total_docs += len(documents)
                     logger.info(f"Loaded {len(documents)} documents from {source_dir}")
                 else:
                     logger.warning(f"No documents found in {source_dir}")
@@ -774,6 +884,18 @@ def main():
         if not all_documents:
             logger.error("No documents found in any source directory. Exiting.")
             sys.exit(1)
+            
+        # Update total documents count
+        metrics.total_documents = total_docs
+        
+        # Check LLM availability before starting processing
+        if not check_llm_availability():
+            logger.warning("LLM service is not available. Will use fallback question generation.")
+            if not args.enhance_answers:
+                logger.info("Answer enhancement is disabled, continuing with basic processing.")
+            else:
+                logger.warning("Answer enhancement is enabled but LLM is unavailable. Disabling enhancement.")
+                args.enhance_answers = False
         
         # Split documents into chunks
         try:

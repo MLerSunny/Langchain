@@ -135,8 +135,7 @@ def rag_engine(temp_config_file, mock_embeddings, mock_vector_store, mock_llm):
     """Create a RAG engine instance with mocked components."""
     with patch('core.rag_engine.HuggingFaceEmbeddings', return_value=mock_embeddings), \
          patch('core.rag_engine.Chroma', return_value=mock_vector_store), \
-         patch('core.rag_engine.HuggingFacePipeline', return_value=mock_llm), \
-         patch('core.rag_engine.ChatOpenAI', return_value=mock_llm):
+         patch('core.rag_engine.HuggingFacePipeline', return_value=mock_llm):
         engine = RAGEngine(config_path=temp_config_file)
         return engine
 
