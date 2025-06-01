@@ -38,9 +38,9 @@ def create_default_config():
             "cache_ttl": 7200
         },
         "llm": {
-            "model": "deepseek-ai/deepseek-llm-7b-base",
+            "model": "microsoft/phi-2",
             "temperature": 0.7,
-            "max_tokens": 4096,
+            "max_tokens": 2048,
             "top_p": 0.95,
             "frequency_penalty": 0.0,
             "presence_penalty": 0.0

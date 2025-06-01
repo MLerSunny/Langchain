@@ -26,7 +26,8 @@ import chromadb
 from langchain_community.document_loaders import (
     PyPDFLoader, 
     Docx2txtLoader, 
-    CSVLoader
+    CSVLoader,
+    TextLoader
 )
 from langchain_unstructured import UnstructuredLoader
 from langchain_chroma import Chroma
@@ -135,12 +136,10 @@ class ProgressTracker:
     
     def print_summary(self):
         elapsed = time.time() - self.start_time
-        
         print("\n\n=== Ingestion Summary ===")
         print(f"Total time: {datetime.timedelta(seconds=int(elapsed))}")
         print(f"Files processed: {self.processed_files}/{self.total_files}")
         print(f"Total chunks generated: {self.total_chunks}")
-        
         # Print operation timing statistics
         print("\nOperation Timing Statistics:")
         for operation, times in self.operation_times.items():
@@ -150,7 +149,6 @@ class ProgressTracker:
                 print(f"  Average time: {avg_time:.2f} seconds")
                 print(f"  Total time: {sum(times):.2f} seconds")
                 print(f"  Operations: {len(times)}")
-        
         # Print failure statistics
         if self.failed_files or self.failed_chunks:
             print("\nFailure Statistics:")
@@ -162,9 +160,11 @@ class ProgressTracker:
                 print(f"Failed chunks: {len(self.failed_chunks)}")
                 for failure in self.failed_chunks:
                     print(f"  - Chunk {failure['chunk']}: {failure['error']}")
-        
-        print(f"\nAverage processing time per file: {elapsed/self.processed_files:.2f} seconds")
-        print(f"Average chunks per file: {self.total_chunks/self.processed_files:.2f}")
+        if self.processed_files > 0:
+            print(f"\nAverage processing time per file: {elapsed/self.processed_files:.2f} seconds")
+            print(f"Average chunks per file: {self.total_chunks/self.processed_files:.2f}")
+        else:
+            print("\nNo files were processed, so averages cannot be computed.")
 
 def extract_metadata_from_path(file_path: str) -> Dict[str, Any]:
     """
@@ -244,147 +244,69 @@ def validate_sharegpt_json(file_path: str) -> bool:
 
 
 def load_documents(source_paths: List[str], progress_tracker: ProgressTracker) -> List[Document]:
-    """
-    Load documents from a list of file paths.
-    Enhanced: Stricter ShareGPT validation, metadata enrichment, logging, summary.
-    """
+    """Load documents from file paths with detailed logging."""
     documents = []
-    processed_files = 0
-    skipped_files = 0
-    errored_files = 0
-    total_files = len(source_paths)
-    progress_tracker.total_files = total_files
-    processed_count = 0
-    
-    print(f"\nStarting document ingestion. Total files to process: {total_files}")
-    
     for file_path in source_paths:
+        print(f"\nLoading document: {file_path}")
         try:
-            processed_count += 1
-            file = os.path.basename(file_path)
-            print(f"\nProcessing file {processed_count}/{total_files}: {file}")
-            progress_tracker.update_file_progress(file, "Loading")
-            
-            file_ext = os.path.splitext(file)[1].strip().lower()
-            print(f"[DEBUG] file_ext for {file}: '{file_ext}'")
-            if file_ext == ".jsonl":
-                logger.info(f"Skipping .jsonl file (not supported for ShareGPT ingestion): {file_path}")
-                skipped_files += 1
-                continue
-            
-            print(f"Loading file: {file_path}")
-            metadata = extract_metadata_from_path(file_path)
-            metadata["original_filename"] = file
-            metadata["ingestion_timestamp"] = datetime.datetime.now().isoformat()
-            
-            # Load based on file type
-            print(f"Using loader for file type: {file_ext}")
-            try:
-                if file_ext == ".json":
-                    if validate_sharegpt_json(file_path):
-                        logger.info(f"Valid ShareGPT JSON file: {file_path}")
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                        docs = []
-                        for item in data:
-                            for conv in item["conversations"]:
-                                doc = Document(page_content=conv["value"], metadata=metadata)
-                                docs.append(doc)
-                    else:
-                        logger.warning(f"Invalid ShareGPT JSON file: {file_path}, skipping.")
-                        skipped_files += 1
-                        continue
-                elif file_ext == ".pdf":
-                    loader = PyPDFLoader(file_path)
-                    docs = loader.load()
-                elif file_ext in [".docx", ".doc"]:
-                    loader = Docx2txtLoader(file_path)
-                    docs = loader.load()
-                elif file_ext == ".csv":
-                    loader = CSVLoader(file_path)
-                    docs = loader.load()
-                elif file_ext == ".txt":
-                    # For text files, try to detect encoding and load directly
-                    try:
-                        print(f"Attempting to load text file directly: {file_path}")
-                        import chardet
-                        with open(file_path, 'rb') as f:
-                            raw_data = f.read()
-                            result = chardet.detect(raw_data)
-                            encoding = result['encoding'] if result['encoding'] else 'utf-8'
-                            print(f"Detected encoding: {encoding}")
-                        
-                        with open(file_path, 'r', encoding=encoding) as f:
-                            content = f.read()
-                            if not content.strip():
-                                raise ValueError("File is empty or contains only whitespace")
-                            docs = [Document(page_content=content, metadata=metadata)]
-                            print(f"Successfully loaded text file: {file_path}")
-                    except Exception as e:
-                        error_msg = f"Error in direct text loading: {str(e)}"
-                        print(error_msg)
-                        logger.error(error_msg)
-                        
-                        # Fallback to UnstructuredLoader
-                        try:
-                            print(f"Attempting to load with UnstructuredLoader: {file_path}")
-                            loader = UnstructuredLoader(file_path, encoding=encoding)
-                            docs = loader.load()
-                            print(f"Successfully loaded text file using UnstructuredLoader: {file_path}")
-                        except Exception as e2:
-                            error_msg = f"Error using UnstructuredLoader: {str(e2)}"
-                            print(error_msg)
-                            logger.error(error_msg)
-                            traceback.print_exc()
-                            raise Exception(f"Failed to load text file. Direct loading error: {str(e)}. UnstructuredLoader error: {str(e2)}")
+            # Use appropriate loader based on file extension
+            file_ext = os.path.splitext(file_path)[1].lower()
+            if file_ext == '.txt':
+                from langchain_community.document_loaders import TextLoader
+                loader = TextLoader(file_path, encoding='utf-8')
+            elif file_ext == '.pdf':
+                from langchain_community.document_loaders import PyPDFLoader
+                loader = PyPDFLoader(file_path)
+            elif file_ext == '.docx':
+                from langchain_community.document_loaders import Docx2txtLoader
+                loader = Docx2txtLoader(file_path)
+            elif file_ext == '.json':
+                import json
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    text_content = "\n".join([str(item) for item in data])
                 else:
-                    # For other file types, try UnstructuredLoader
-                    try:
-                        loader = UnstructuredLoader(file_path)
-                        docs = loader.load()
-                    except Exception as e:
-                        logger.error(f"Error loading {file_path} with UnstructuredLoader: {str(e)}")
-                        traceback.print_exc()
-                        raise
-                
-                if not docs:
-                    raise ValueError("No documents were loaded from the file")
-                
-                print(f"Loaded {len(docs)} documents from {file_path}")
-                
-                for doc in docs:
-                    if not doc.page_content.strip():
-                        print(f"Warning: Empty document content in {file_path}")
-                        continue
-                    doc_hash = calculate_document_hash(doc.page_content)
-                    doc.metadata.update(metadata)
-                    doc.metadata["doc_hash"] = doc_hash
+                    text_content = json.dumps(data, indent=2)
+                docs = [Document(
+                    page_content=text_content,
+                    metadata={
+                        'source': file_path,
+                        'file_type': 'json',
+                        'chunk_index': 0
+                    }
+                )]
+                print(f"Loaded JSON file: {file_path}")
                 documents.extend(docs)
-                logger.info(f"Successfully processed {file_path}")
-                processed_files += 1
-                
-            except Exception as e:
-                error_msg = f"Error loading {file_path}: {str(e)}"
-                logger.error(error_msg)
-                print(error_msg)
-                traceback.print_exc()
-                errored_files += 1
+                if progress_tracker:
+                    progress_tracker.processed_files += 1
                 continue
-            
+            else:
+                print(f"Using UnstructuredLoader for {file_ext} file")
+                loader = UnstructuredLoader(file_path)
+            print(f"Loading with {loader.__class__.__name__}...")
+            docs = loader.load()
+            print(f"Loaded {len(docs)} chunks from {file_path}")
+            for i, doc in enumerate(docs):
+                if not hasattr(doc, 'metadata'):
+                    doc.metadata = {}
+                doc.metadata.update({
+                    'source': file_path,
+                    'file_type': file_ext[1:],
+                    'chunk_index': i
+                })
+                print(f"Chunk {i+1} metadata: {doc.metadata}")
+                print(f"Chunk {i+1} preview: {doc.page_content[:200]}...")
+            documents.extend(docs)
+            if progress_tracker:
+                progress_tracker.processed_files += 1
         except Exception as e:
-            error_msg = f"Error processing {file_path}: {str(e)}"
-            logger.error(error_msg)
+            error_msg = f"Error loading {file_path}: {str(e)}"
             print(error_msg)
-            traceback.print_exc()
-            errored_files += 1
+            print(f"Stack trace: {traceback.format_exc()}")
+            if progress_tracker:
+                progress_tracker.record_failure(file_path, error_msg, "file")
             continue
-    
-    print("\n\nIngestion Summary:")
-    print(f"Total files processed: {processed_files}")
-    print(f"Files skipped: {skipped_files}")
-    print(f"Files with errors: {errored_files}")
-    print(f"Total documents loaded: {len(documents)}")
-    
     return documents
 
 
@@ -447,7 +369,7 @@ def store_documents(vector_store: Chroma, chunks: List[Document], batch_size: in
     print(f"\nStoring {len(chunks)} chunks in vector database...")
     total_chunks = len(chunks)
     failed_chunks = []
-    max_retries = 3  # Maximum number of retries for failed chunks
+    max_retries = 3
     retry_count = 0
     
     # Process in smaller batches to show progress
@@ -627,6 +549,14 @@ def create_vector_store(config: dict, rebuild: bool = False):
     vector_store_config = config['vector_store']
     embeddings_config = config['embeddings']
     
+    # Ensure we're using the correct persist directory
+    persist_dir = os.path.abspath(vector_store_config['persist_directory'])
+    if rebuild and os.path.exists(persist_dir):
+        print(f"[INFO] Rebuild mode: Deleting existing vector store at {persist_dir}")
+        shutil.rmtree(persist_dir)
+        os.makedirs(persist_dir, exist_ok=True)
+    
+    print(f"[INFO] Using embedding model: {embeddings_config['model']}")
     # Initialize embeddings
     print("Loading embedding model...")
     embeddings = HuggingFaceEmbeddings(
@@ -643,10 +573,10 @@ def create_vector_store(config: dict, rebuild: bool = False):
         "hnsw:M": vector_store_config['index_params']['hnsw_m']
     }
     
-    print("Creating ChromaDB client...")
+    print(f"Creating ChromaDB client at {persist_dir}...")
     # Create persistent ChromaDB client
     client = chromadb.PersistentClient(
-        path=vector_store_config['persist_directory'],
+        path=persist_dir,
         settings=Settings(
             anonymized_telemetry=False,
             allow_reset=rebuild
@@ -666,7 +596,7 @@ def create_vector_store(config: dict, rebuild: bool = False):
         client=client,
         collection_name=vector_store_config['collection_name'],
         embedding_function=embeddings,
-        persist_directory=vector_store_config['persist_directory']
+        persist_directory=persist_dir
     )
     
     return vector_store
@@ -704,10 +634,15 @@ def main():
     parser = argparse.ArgumentParser(description="Process documents and store them in the vector database")
     parser.add_argument("--source-dir", "-s", type=str, required=True, help="Directory containing source documents")
     parser.add_argument("--config", type=str, default="config/rag.yaml", help="Path to configuration file")
-    parser.add_argument("--rebuild", action="store_true", help="Rebuild the vector store")
-    parser.add_argument("--mode", type=str, choices=["append", "rebuild"], default="append", help="Ingestion mode")
+    parser.add_argument("--rebuild", action="store_true", help="Rebuild the vector store (overrides mode)")
+    parser.add_argument("--mode", type=str, choices=["append", "rebuild"], default="append", 
+                       help="Ingestion mode (default: append)")
     parser.add_argument("--batch-size", type=int, default=10, help="Number of files to process in each batch")
     args = parser.parse_args()
+    
+    # If rebuild flag is set, override mode
+    if args.rebuild:
+        args.mode = "rebuild"
     
     print("\nStarting bulk ingestion process...")
     print(f"Source directory: {args.source_dir}")
@@ -798,22 +733,27 @@ def main():
         # Print final summary
         progress_tracker.print_summary()
         
-        # Health check
+        # Health check with relevant queries
         print("\nPerforming health check...")
-        test_query = "test query"
-        results = vector_store.similarity_search(test_query, k=1)
-        if results:
-            print("Vector store health check passed")
-        else:
-            print("Vector store health check failed")
+        test_queries = [
+            "What is attention in transformer models?",
+            "How does RAG work?",
+            "What are the key components?"
+        ]
+        for query in test_queries:
+            results = vector_store.similarity_search(query, k=1)
+            if results:
+                print(f"Query '{query}' returned results from: {results[0].metadata.get('source', 'unknown')}")
+                print(f"Content preview: {results[0].page_content[:200]}...")
+            else:
+                print(f"Query '{query}' returned no results")
         
         print("\nBulk ingestion completed!")
-        print(f"Total files processed: {total_processed}")
-        print(f"Total chunks stored: {total_documents}")
         
     except Exception as e:
-        print(f"Fatal error in main process: {str(e)}")
-        raise
+        print(f"Error during bulk ingestion: {str(e)}")
+        print(traceback.format_exc())
+        sys.exit(1)
 
 
 if __name__ == "__main__":

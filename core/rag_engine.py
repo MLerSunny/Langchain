@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
 from langchain_core.documents import Document
 from langchain_community.cache import InMemoryCache
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -22,10 +22,10 @@ import psutil
 from core.metrics import MetricsEvaluator
 import re
 import torch
-from langchain_community.llms.huggingface_pipeline import HuggingFacePipeline
 from core.settings import settings
 from core.exceptions import RAGError
-from vllm import LLM, SamplingParams
+from core.llm_backends.factory import LLMBackendFactory
+import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -202,15 +202,29 @@ class RAGEngine:
     """RAG (Retrieval-Augmented Generation) engine for document processing and retrieval."""
     
     def __init__(self):
-        """Initialize RAG engine with configuration from settings."""
-        self.config = settings
-        self.metrics = RAGMetrics()
-        self.metrics_evaluator = MetricsEvaluator()
+        """Initialize the RAG engine."""
+        self.config = self._load_config()
         self._initialize_components()
-        self._load_spacy_model()
+    
+    def _load_config(self) -> Dict[str, Any]:
+        """Load configuration from settings."""
+        return {
+            'llm': settings.get('llm', {}),
+            'vector_store': settings.get('vector_store', {}),
+            'optimization': settings.get('optimization', {}),
+            'query': {
+                'system_prompt': settings.get('query', {}).get('system_prompt', 'You are a helpful AI assistant.'),
+                'query_template': settings.get('query', {}).get('query_template', '{query}'),
+                'preprocess': settings.get('query', {}).get('preprocess', True),
+                'max_query_length': settings.get('query', {}).get('max_query_length', 1000),
+                'expand_queries': settings.get('query', {}).get('expand_queries', False)
+            },
+            'error_handling': settings.get('error_handling', {}),
+            'embeddings': settings.get('embeddings', {})
+        }
     
     def _initialize_components(self) -> None:
-        """Initialize RAG components based on configuration."""
+        """Initialize all RAG components."""
         try:
             # Initialize text splitter
             self.text_splitter = self._initialize_text_splitter()
@@ -221,21 +235,29 @@ class RAGEngine:
             # Initialize vector store
             self.vector_store = self._initialize_vector_store()
             
-            # Initialize reranker if enabled
-            if self.config['retrieval']['rerank_results']:
-                self.reranker = CrossEncoder(self.config['retrieval']['rerank_model'])
-            
-            # Initialize cache as a dictionary
-            if self.config['cache']['enabled']:
-                self.cache = {}
-            
-            # Initialize LLM
-            self.llm = self._initialize_llm()
+            # Initialize LLM backend
+            self.llm_backend = self._initialize_llm()
             
             # Initialize prompt template
-            self.prompt_template = self._initialize_prompt_template()
+            self._initialize_prompt_template()
             
-            logger.info("RAG components initialized successfully")
+            # Initialize cross-encoder for reranking if enabled
+            if self.config.get('retrieval', {}).get('rerank_results', False):
+                try:
+                    from sentence_transformers import CrossEncoder
+                    rerank_model = self.config['retrieval'].get('rerank_model', 'cross-encoder/ms-marco-MiniLM-L-6-v2')
+                    self.cross_encoder = CrossEncoder(rerank_model)
+                    logger.info(f"Initialized cross-encoder with model: {rerank_model}")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize cross-encoder: {str(e)}")
+                    self.cross_encoder = None
+            else:
+                self.cross_encoder = None
+            
+            # Initialize metrics
+            self.metrics = RAGMetrics()
+            
+            logger.info("All RAG components initialized successfully")
             
         except Exception as e:
             logger.error(f"Error initializing RAG components: {str(e)}")
@@ -257,10 +279,37 @@ class RAGEngine:
     def _initialize_embeddings(self) -> HuggingFaceEmbeddings:
         """Initialize embeddings model based on configuration."""
         try:
+            embeddings_config = self.config['embeddings']
+            device = embeddings_config.get('device', 'auto')
+            if device == 'auto':
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            
+            model_kwargs = {
+                'trust_remote_code': embeddings_config.get('trust_remote_code', True),
+                'device': device,
+                'local_files_only': embeddings_config.get('local_files_only', True)
+            }
+            encode_kwargs = {
+                'normalize_embeddings': embeddings_config.get('normalize_embeddings', True)
+            }
+            
+            # Check if model directory exists
+            model_path = embeddings_config['model']
+            if not os.path.exists(model_path):
+                logger.warning(f"Model directory {model_path} does not exist. Creating directory...")
+                os.makedirs(model_path, exist_ok=True)
+                
+                # Download a small model for testing
+                from sentence_transformers import SentenceTransformer
+                model = SentenceTransformer('all-MiniLM-L6-v2')
+                model.save(model_path)
+                logger.info(f"Model downloaded and saved to {model_path}")
+            
             return HuggingFaceEmbeddings(
-                model_name=settings.get("embeddings.model"),
-                model_kwargs={"device": "cuda" if settings.get("optimization.use_gpu", False) else "cpu"},
-                encode_kwargs={"normalize_embeddings": True}
+                model_name=model_path,
+                model_kwargs=model_kwargs,
+                encode_kwargs=encode_kwargs,
+                cache_folder=embeddings_config.get('cache_dir')
             )
         except Exception as e:
             logger.error(f"Error initializing embeddings: {str(e)}")
@@ -269,8 +318,26 @@ class RAGEngine:
     def _initialize_vector_store(self) -> Chroma:
         """Initialize vector store based on configuration."""
         try:
-            persist_directory = settings.get("vector_store.persist_directory")
-            collection_name = settings.get("vector_store.collection_name", "documents")
+            # Try to get vector store settings with fallback
+            persist_directory = (
+                settings.get("vector_store", {}).get("persist_directory")
+                or settings.get("vector_store.persist_directory")
+                or "data/vector_store/chroma"
+            )
+            collection_name = (
+                settings.get("vector_store", {}).get("collection_name")
+                or settings.get("vector_store.collection_name")
+                or "documents"
+            )
+            
+            # Print debug info
+            print(f"[DEBUG] Vector store settings:")
+            print(f"[DEBUG] - persist_directory: {persist_directory}")
+            print(f"[DEBUG] - collection_name: {collection_name}")
+            print(f"[DEBUG] - settings keys: {list(settings.keys())}")
+            
+            # Create directory if it doesn't exist
+            os.makedirs(persist_directory, exist_ok=True)
             
             return Chroma(
                 persist_directory=persist_directory,
@@ -282,42 +349,36 @@ class RAGEngine:
             raise RAGError(f"Failed to initialize vector store: {str(e)}")
     
     def _initialize_llm(self):
-        """Initialize the vLLM language model for inference."""
+        """Initialize the LLM backend."""
         try:
-            llm_config = self.config['llm']
-            self.sampling_params = SamplingParams(
-                temperature=llm_config.get('temperature', 0.7),
-                top_p=llm_config.get('top_p', 0.95),
-                max_tokens=llm_config.get('max_tokens', 4096),
-                frequency_penalty=llm_config.get('frequency_penalty', 0.0),
-                presence_penalty=llm_config.get('presence_penalty', 0.0)
-            )
-            self.llm = LLM(
-                model=llm_config['model'],
-                dtype="auto",
-                tensor_parallel_size=self.config.get('optimization', {}).get('tensor_parallel_size', 1),
-                gpu_memory_utilization=self.config.get('optimization', {}).get('gpu_memory_utilization', 0.9),
-                max_model_len=llm_config.get('max_tokens', 4096)
-            )
+            # Get backend name from config, default to huggingface
+            backend_name = self.config.get('llm', {}).get('backend', 'huggingface')
+            
+            # Get backend instance
+            backend = LLMBackendFactory.get_backend(backend_name)
+            
+            # Initialize backend with config
+            backend.initialize(self.config)
+            
+            logger.info(f"Initialized {backend_name} backend successfully")
+            return backend
         except Exception as e:
-            logger.error(f"Error initializing vLLM: {str(e)}")
-            raise RAGError(f"Failed to initialize vLLM: {str(e)}")
+            logger.error(f"Error initializing LLM backend: {str(e)}")
+            raise RAGError(f"Failed to initialize LLM backend: {str(e)}")
 
     def _initialize_prompt_template(self):
         """Initialize the prompt template."""
         try:
             system_prompt = self.config['query']['system_prompt']
-            query_template = self.config['query']['query_template']
-            
-            template = f"""System: {system_prompt}
-
-Context: {{context}}
-
-Human: {query_template}
-
-Assistant: Let me help you with that based on the provided context."""
-            
-            return template
+            # Use a standard retrieval QA prompt
+            self.prompt_template = (
+                f"System: {system_prompt}\n\n"
+                "Use the following pieces of context to answer the question at the end. "
+                "If you don't know the answer, just say that you don't know, don't try to make up an answer.\n\n"
+                "{context}\n\n"
+                "Question: {query}\n"
+                "Helpful Answer:"
+            )
         except Exception as e:
             logger.error(f"Error initializing prompt template: {str(e)}")
             raise RAGError(f"Failed to initialize prompt template: {str(e)}")
@@ -663,7 +724,9 @@ Assistant: Let me help you with that based on the provided context."""
                 
                 # Generate new response
                 context = "\n\n".join([doc.page_content for doc in documents])
-                response = self.llm.invoke(enhanced_prompt.format(context=context, query=query))
+                response = self.llm_backend.generate(
+                    prompt=enhanced_prompt.format(context=context, query=query)
+                )
                 
                 # Validate new response
                 new_validation = self._validate_response(response, query, documents)
@@ -685,16 +748,38 @@ Assistant: Let me help you with that based on the provided context."""
         return self.config['error_handling']['fallback_responses']['generation_error'], []
 
     def retrieve(self, query: str) -> List[Document]:
-        """Stub: Retrieve documents relevant to the query. Returns two dummy Documents for testing."""
+        """Retrieve documents relevant to the query from the vector store."""
         import time
         start_time = time.time()
-        docs = [
-            Document(page_content="Test document 1", metadata={"source": "test1"}),
-            Document(page_content="Test document 2", metadata={"source": "test2"})
-        ]
+        # Get initial results with a larger k to allow for filtering
+        initial_docs = self.vector_store.similarity_search(query, k=10)
+        print(f"[DEBUG] Initial docs sources: {[doc.metadata.get('source', 'N/A') for doc in initial_docs]}")
+        # Rerank results using cross-encoder if available
+        if hasattr(self, 'cross_encoder') and self.cross_encoder:
+            reranked_docs = self._rerank_results(query, initial_docs)
+        else:
+            reranked_docs = initial_docs
+        # Filter out low relevance documents
+        filtered_docs = []
+        for doc in reranked_docs:
+            # Calculate simple relevance score
+            query_terms = set(query.lower().split())
+            doc_terms = set(doc.page_content.lower().split())
+            relevance = len(query_terms.intersection(doc_terms)) / len(query_terms) if query_terms else 0
+            # Only keep documents with reasonable relevance
+            if relevance > 0.1:  # Adjust threshold as needed
+                filtered_docs.append(doc)
+        # Take top 5 after filtering
+        final_docs = filtered_docs[:5]
+        # Debug output
+        print(f"[RETRIEVE DEBUG] Retrieved {len(final_docs)} docs for query: '{query}'")
+        for i, doc in enumerate(final_docs):
+            src = doc.metadata.get('source', 'N/A') if hasattr(doc, 'metadata') else 'N/A'
+            content = doc.page_content[:200] if hasattr(doc, 'page_content') else str(doc)[:200]
+            print(f"[RETRIEVE DEBUG] Doc {i+1}: Source: {src}\n[RETRIEVE DEBUG] Content: {content}\n")
         elapsed = time.time() - start_time
         self.metrics.retrieval_latency = elapsed if elapsed > 0 else 0.001
-        return docs
+        return final_docs
 
     def generate_response(
         self,
@@ -703,32 +788,27 @@ Assistant: Let me help you with that based on the provided context."""
         stream: bool = False,
         reference_answer: Optional[str] = None
     ) -> Union[Tuple[str, List[Document]], Iterator[Tuple[str, List[Document]]]]:
-        """
-        Generate a response using vLLM.
-        """
+        """Generate a response using the LLM backend."""
         try:
-            # Prepare context from retrieved documents
-            context = "\n".join([doc.page_content for doc in documents])
-            prompt = self.config['query']['query_template'].format(query=query, context=context)
-
-            # vLLM expects a list of prompts
-            start_time = time.time()
-            outputs = self.llm.generate(
-                prompts=[prompt],
-                sampling_params=self.sampling_params
+            # Format context from documents
+            context = "\n\n".join([doc.page_content for doc in documents])
+            
+            # Format prompt with context and query
+            prompt = self.prompt_template.format(
+                context=context,
+                query=query
             )
-            elapsed = time.time() - start_time
-            response = outputs[0].outputs[0].text  # Get the generated text
-
-            # Metrics: latency and token usage
-            self.metrics.generation_latency = elapsed if elapsed > 0 else 0.001
-            self.metrics.token_usage += len(response.split())  # Approximate token count
-
-            sources = [{"content": doc.page_content, "metadata": doc.metadata} for doc in documents]
+            
+            # Generate response using backend
+            response, sources = self.llm_backend.generate(
+                prompt=prompt,
+                documents=documents,
+                stream=stream
+            )
+            
             return response, sources
-
         except Exception as e:
-            logger.error(f"Error generating response with vLLM: {str(e)}", exc_info=True)
+            logger.error(f"Error generating response: {str(e)}")
             return (
                 self.config['error_handling']['fallback_responses']['generation_error'],
                 []
@@ -740,20 +820,14 @@ Assistant: Let me help you with that based on the provided context."""
         stream: bool = False
     ) -> Union[Tuple[str, List[Dict[str, Any]]], Iterator[Tuple[str, List[Dict[str, Any]]]]]:
         """Process a query and return response with sources."""
-        # Initialize cache if not exists
-        if not hasattr(self, 'cache'):
-            self.cache = {}
-        
-        # Check cache if enabled and not streaming
-        if self.config.get('cache', {}).get('enabled', False) and not stream:
-            if query in self.cache:
-                self.metrics.cache_hits += 1
-                return self.cache[query]
-            self.metrics.cache_misses += 1
-        
         # Retrieve relevant documents
         try:
             documents = self.retrieve(query)
+            print(f"[DEBUG] Retrieved {len(documents)} documents for query: '{query}'")
+            for i, doc in enumerate(documents):
+                src = doc.metadata.get('source', 'N/A') if hasattr(doc, 'metadata') else 'N/A'
+                content = doc.page_content[:200] if hasattr(doc, 'page_content') else str(doc)[:200]
+                print(f"[DEBUG] Doc {i+1}: Source: {src}\n[DEBUG] Content: {content}\n")
         except RetrievalError as e:
             logger.error(f"Retrieval error: {str(e)}")
             if stream:
@@ -770,10 +844,6 @@ Assistant: Let me help you with that based on the provided context."""
         try:
             result = self.generate_response(query, documents, stream=stream)
             
-            # Cache result if enabled and not streaming
-            if self.config.get('cache', {}).get('enabled', False) and not stream:
-                self.cache[query] = result
-            
             return result
             
         except Exception as e:
@@ -789,24 +859,25 @@ Assistant: Let me help you with that based on the provided context."""
                 )
     
     def get_metrics(self) -> Dict[str, Any]:
-        """Get current metrics."""
+        """Get metrics from all components."""
         return {
-            'retrieval_latency': self.metrics.retrieval_latency,
-            'generation_latency': self.metrics.generation_latency,
-            'cache_hits': self.metrics.cache_hits,
-            'cache_misses': self.metrics.cache_misses,
-            'token_usage': self.metrics.token_usage,
-            'query_success_rate': self.metrics.query_success_rate,
-            'response_quality': self.metrics.response_quality,
-            'rouge_scores': self.metrics.rouge_scores,
-            'bert_scores': self.metrics.bert_scores,
-            'bleu_score': self.metrics.bleu_score,
-            'meteor_score': self.metrics.meteor_score,
-            'wer_score': self.metrics.wer_score,
-            'perplexity': self.metrics.perplexity,
-            'semantic_similarity': self.metrics.semantic_similarity,
-            'evaluation_history': self.metrics.evaluation_history,
-            'error_history': self.metrics.error_history
+            'retrieval_latency': float(self.metrics.retrieval_latency),
+            'generation_latency': float(self.metrics.generation_latency),
+            'cache_hits': int(self.metrics.cache_hits),
+            'cache_misses': int(self.metrics.cache_misses),
+            'token_usage': int(self.metrics.token_usage),
+            'total_queries': int(self.metrics.total_queries),
+            'successful_queries': int(self.metrics.successful_queries),
+            'failed_queries': int(self.metrics.failed_queries),
+            'query_success_rate': float(self.metrics.query_success_rate),
+            'response_quality': float(self.metrics.response_quality),
+            'rouge_scores': dict(self.metrics.rouge_scores),
+            'bert_scores': dict(self.metrics.bert_scores),
+            'bleu_score': float(self.metrics.bleu_score),
+            'meteor_score': float(self.metrics.meteor_score),
+            'wer_score': float(self.metrics.wer_score),
+            'perplexity': float(self.metrics.perplexity),
+            'semantic_similarity': float(self.metrics.semantic_similarity)
         }
     
     def reset_metrics(self):
@@ -1023,3 +1094,84 @@ Assistant: Let me help you with that based on the provided context."""
             validation['issues'].append("No source citations found")
         
         return validation 
+
+    async def cleanup(self) -> None:
+        """Cleanup resources."""
+        try:
+            # Clean up LLM backend if it exists and has cleanup method
+            if hasattr(self, 'llm_backend') and self.llm_backend is not None:
+                cleanup_method = getattr(self.llm_backend, 'cleanup', None)
+                if cleanup_method is not None and callable(cleanup_method):
+                    try:
+                        if asyncio.iscoroutinefunction(cleanup_method):
+                            await cleanup_method()
+                        else:
+                            cleanup_method()
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up LLM backend: {str(e)}")
+            
+            # Clean up vector store if it exists
+            if hasattr(self, 'vector_store') and self.vector_store is not None:
+                cleanup_method = getattr(self.vector_store, 'cleanup', None)
+                if cleanup_method is not None and callable(cleanup_method):
+                    try:
+                        if asyncio.iscoroutinefunction(cleanup_method):
+                            await cleanup_method()
+                        else:
+                            cleanup_method()
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up vector store: {str(e)}")
+            
+            # Clean up embeddings if it exists
+            if hasattr(self, 'embeddings') and self.embeddings is not None:
+                cleanup_method = getattr(self.embeddings, 'cleanup', None)
+                if cleanup_method is not None and callable(cleanup_method):
+                    try:
+                        if asyncio.iscoroutinefunction(cleanup_method):
+                            await cleanup_method()
+                        else:
+                            cleanup_method()
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up embeddings: {str(e)}")
+            
+            logger.info("RAG engine cleanup completed successfully")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+            # Don't raise the error to allow graceful shutdown
+
+    def add_documents(self, documents: List[Union[Dict[str, Any], Document]]) -> bool:
+        """
+        Add documents to the vector store.
+        
+        Args:
+            documents: List of documents to add, each can be either:
+                     - A dictionary with 'text' and optional 'metadata'
+                     - A Document object with page_content and metadata
+                     
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Process each document
+            processed_docs = []
+            for doc in documents:
+                if isinstance(doc, dict):
+                    text = doc.get('text', '')
+                    metadata = doc.get('metadata', {})
+                else:  # Document object
+                    text = doc.page_content
+                    metadata = doc.metadata
+                    
+                chunks = self.process_document(text, metadata)
+                processed_docs.extend(chunks)
+            
+            # Add to vector store
+            if processed_docs:
+                self.vector_store.add_documents(processed_docs)
+                logger.info(f"Added {len(processed_docs)} document chunks to vector store")
+                return True
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error adding documents: {str(e)}")
+            return False 

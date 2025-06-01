@@ -12,4 +12,8 @@ class GenerationError(RAGError):
 
 class ConfigError(RAGError):
     """Exception for configuration errors in RAG."""
+    pass
+
+class ModelOptimizationError(Exception):
+    """Exception for model optimization errors."""
     pass 

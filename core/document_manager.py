@@ -11,11 +11,11 @@ from typing import List, Optional, Dict, Any
 import chromadb
 from chromadb.config import Settings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 import torch
 
-from core.settings import settings
+from core.settings import settings, MODELS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +25,41 @@ __all__ = ['DocumentManager']
 class DocumentManager:
     """Manages document loading, processing, and vector database operations."""
     
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(DocumentManager, cls).__new__(cls)
+        return cls._instance
+    
     def __init__(self):
         """Initialize the document manager."""
-        self.chroma_client = chromadb.Client(Settings(
-            persist_directory=settings.chroma_persist_directory,
-            anonymized_telemetry=False
-        ))
+        if DocumentManager._initialized:
+            return
+            
+        # Ensure we have a valid persist directory
+        persist_dir = settings.get('vector_store.persist_directory')
+        if not persist_dir:
+            persist_dir = os.path.join(os.getcwd(), 'data', 'vector_store')
+            os.makedirs(persist_dir, exist_ok=True)
+            
+        # Create Chroma client with consistent settings
+        self.chroma_client = chromadb.PersistentClient(
+            path=persist_dir,
+            settings=Settings(
+                anonymized_telemetry=False,
+                allow_reset=True
+            )
+        )
         
         # Get embedding configuration from settings
-        model_name = settings.get('embeddings.model')
+        model_path = os.path.join(MODELS_DIR, "embeddings")
+        if not os.path.exists(model_path):
+            os.makedirs(model_path, exist_ok=True)
+            # Download a small model for testing
+            model_path = "sentence-transformers/all-MiniLM-L6-v2"
+            
         device = settings.get('embeddings.device', 'auto')
         if device == 'auto':
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -47,17 +73,19 @@ class DocumentManager:
         }
         
         self.embeddings = HuggingFaceEmbeddings(
-            model_name=model_name,
+            model_name=model_path,
             model_kwargs=model_kwargs,
             encode_kwargs=encode_kwargs,
             cache_folder=settings.get('embeddings.cache_dir')
         )
         
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
+            chunk_size=settings.get('chunking.chunk_size', 1000),
+            chunk_overlap=settings.get('chunking.chunk_overlap', 200),
             length_function=len,
         )
+        
+        DocumentManager._initialized = True
     
     def init_vector_db(self, collection_name: str = None) -> None:
         """

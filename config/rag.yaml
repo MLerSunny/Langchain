@@ -1,9 +1,10 @@
 app:
-  name: "Insurance Assistant"
+  name: "RAG System"
   version: "1.0.0"
   environment: "development"
-  debug: true
+  config_path: "config/rag.yaml"
   log_level: "INFO"
+  debug: true
 
 rag:
   chunk_size: 256
@@ -14,12 +15,22 @@ rag:
   cache_ttl: 7200
 
 llm:
-  model: "deepseek-ai/deepseek-llm-7b-base"
+  backend: "huggingface"  # Options: "huggingface" or "vllm"
+  model: "microsoft/phi-2"
   temperature: 0.7
-  max_tokens: 4096
+  max_tokens: 2048
   top_p: 0.95
   frequency_penalty: 0.0
   presence_penalty: 0.0
+  repetition_penalty: 1.15
+  use_8bit: false  # Disable 8-bit quantization by default
+  device_map: "auto"
+  max_memory: {0: "3GB"}
+  local_files_only: true
+  trust_remote_code: true
+  offline_mode: true
+  verify_ssl: false
+  ssl_cert_reqs: "CERT_NONE"
 
 ollama_llm:
   model: "deepseek-llm:7b"
@@ -43,14 +54,17 @@ vector_store:
   index_params:
     hnsw_ef_construction: 100
     hnsw_m: 16
+  mode: "append"  # Default mode for all operations
 
 embeddings:
-  model: "all-MiniLM-L6-v2"
-  cache_dir: "data/cache"
-  batch_size: 64
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  device: "auto"
+  trust_remote_code: true
+  normalize_embeddings: true
+  batch_size: 32
 
 security:
-  api_key: "your-secret-key-here"
+  api_key: "your_api_key_here"
   allowed_origins:
     - "http://localhost:8501"
   rate_limit: 100
@@ -85,67 +99,57 @@ cache:
   memory_limit: "80GB"
 
 query:
+  query_template: "Context: {context}\n\nQuestion: {query}\n\nAnswer:"
+  system_prompt: "You are a helpful AI assistant that answers questions based on the provided context. Always be accurate, concise, and helpful."
   preprocess: true
-  expand_queries: true
   max_query_length: 512
-  query_template: "Answer the following question based on the context: {query}"
-  system_prompt: "You are a helpful AI assistant that answers questions based on the provided context."
+  expand_queries: true
 
 generation:
-  model: "deepseek-ai/deepseek-llm-7b-base"
+  model: "microsoft/phi-2"
   temperature: 0.7
-  max_tokens: 4096
+  max_tokens: 2048
   top_p: 0.95
   frequency_penalty: 0.0
   presence_penalty: 0.0
   stop_sequences: []
   include_sources: true
-  max_source_tokens: 2048
+  max_source_tokens: 1024
   use_fp16: true
-  load_in_8bit: false
   device_map: "auto"
-  max_memory: "80GB"
 
 monitoring:
   enabled: true
   log_level: "INFO"
   metrics:
-    - "response_time"
+    - "latency"
+    - "throughput"
+    - "error_rate"
     - "token_usage"
-    - "cache_hits"
-    - "similarity_scores"
-  alerts:
-    high_latency:
-      threshold: 2000
-      action: "log"
 
 error_handling:
   retry_attempts: 3
   retry_delay: 1000
   fallback_responses:
-    timeout: "I apologize, but I'm taking too long to respond. Please try again."
-    error: "I apologize, but I encountered an error. Please try again."
+    generation_error: "I apologize, but I encountered an error while generating a response. Please try again."
+    retrieval_error: "I apologize, but I encountered an error while retrieving information. Please try again."
+    validation_error: "I apologize, but I couldn't generate a satisfactory response. Please try rephrasing your question."
 
 optimization:
-  parallel_processing: true
-  max_workers: 8
-  batch_processing: true
+  use_gpu: true
   batch_size: 64
-  prefetch_factor: 4
-  pin_memory: true
+  max_workers: 8
   use_fp16: true
-  gradient_checkpointing: false
   use_flash_attention: true
-  use_cache: true
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.9
+  parallel_processing: true
 
 features:
-  semantic_search: true
-  hybrid_search: true
-  query_expansion: true
-  result_reranking: true
-  source_citations: true
-  answer_validation: true
-  context_window: true
+  enable_streaming: true
+  enable_metrics: true
+  enable_caching: true
+  enable_validation: true
 
 nlp:
   spacy_model: "en_core_web_sm"
@@ -157,12 +161,13 @@ nlp:
     - "PERCENT"
     - "DATE"
     - "TIME"
-  sentiment_model: "distilbert-base-uncased-finetuned-sst-2-english"  # Example for transformers sentiment 
+  sentiment_model: "distilbert-base-uncased-finetuned-sst-2-english"
 
 server:
-  host: "localhost"
+  host: "0.0.0.0"
   port: 8000
   fastapi_port: 8000
+  streamlit_port: 8501
   output_dir: "data/models"
 
 # ShareGPT Conversion Settings
@@ -219,4 +224,19 @@ sharegpt:
     format: "json"
     indent: 2
     ensure_ascii: false
-    encoding: "utf-8" 
+    encoding: "utf-8"
+
+fine_tuning:
+  default_epochs: 3
+  default_batch_size: 8
+  default_learning_rate: 2e-5
+
+# Paths
+paths:
+  data_dir: "./data"
+  training_data_dir: "./data/training/data"
+  models_dir: "./data/models"
+  logs_dir: "./data/logs"
+  cache_dir: "./data/cache"
+  metrics_dir: "./data/metrics"
+  jobs_dir: "./data/jobs" 
