@@ -215,3 +215,56 @@ finetune.zip
 data/models/
 data/vector_store/
 
+# Data directories
+data/training/
+data/logs/
+data/jobs/
+data/metrics/
+data/cache/
+data/embeddings_cache/
+data/processed/
+data/source/
+data/eval/
+data/raw/
+data/auto/
+data/vector_store/chroma/
+
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
